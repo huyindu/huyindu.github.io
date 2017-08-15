@@ -1,0 +1,2 @@
+var POSTS_DATA = 
+[];
