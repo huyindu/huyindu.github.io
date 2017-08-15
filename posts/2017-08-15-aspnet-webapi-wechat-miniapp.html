@@ -1,0 +1,139 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>ASP.NET Web API 搭建微信小程序后端 - HoEndo的技术博客</title>
+  <meta name="article-date" content="2017-08-15">
+  <meta name="article-tags" content="ASP.NET,Web API,微信小程序,后端开发">
+  <meta name="description" content="基于 ASP.NET Web API 2 实现微信小程序登录、支付和消息推送的后端对接">
+</head>
+<body>
+  <article class="post-content">
+    <h1>ASP.NET Web API 搭建微信小程序后端</h1>
+
+    <h2>起手：项目结构与依赖</h2>
+    <p>2017 年 1 月微信小程序正式上线，公司让我搭一套后端给小程序用。当时后端技术栈还是 .NET Framework 4.6.2 + ASP.NET Web API 2，不算新但足够稳。NuGet 引入三个关键包：<code>Senparc.Weixin.MP</code> 处理微信服务端交互、<code>Senparc.Weixin.Open</code> 做第三方平台相关（后面用不到但先留着）、以及 <code>Newtonsoft.Json</code> 序列化。</p>
+
+    <pre><code class="language-bash">Install-Package Senparc.Weixin.MP -Version 14.3.0
+Install-Package Senparc.Weixin.Open -Version 2.4.0
+Install-Package Newtonsoft.Json -Version 10.0.3</code></pre>
+
+    <p>项目结构直接用 Areas 隔离，小程序相关的 Controller 放在 <code>Areas/MiniApp/Controllers/</code> 下。配置用 <code>web.config</code> 的 <code>appSettings</code> 存 AppId 和 AppSecret，发布时用 web.config transforms 切换。</p>
+
+    <pre><code class="language-xml">&lt;appSettings&gt;
+  &lt;add key="WeChat:AppId" value="wx1234567890abcdef" /&gt;
+  &lt;add key="WeChat:AppSecret" value="your-app-secret-here" /&gt;
+  &lt;add key="WeChat:MchId" value="1234567890" /&gt;
+  &lt;add key="WeChat:PayKey" value="your-pay-key-here" /&gt;
+&lt;/appSettings&gt;</code></pre>
+
+    <h2>登录：code2session 那一摊事</h2>
+    <p>小程序登录和传统 Web 完全不同。前端调用 <code>wx.login</code> 拿到临时 code，后端用这个 code 调微信的 <code>jscode2session</code> 接口换 openid 和 session_key。不能用 session_key 做传统 Session——小程序没有 Cookie 机制，需要自己生成一个自定义登录态（比如 JWT 或自定义 token）返回给前端，前端存到 storage 里每次请求带上。</p>
+
+    <pre><code class="language-csharp">[HttpPost]
+[Route("api/miniapp/auth/login")]
+public async Task&lt;IHttpActionResult&gt; Login(LoginRequest request)
+{
+    var url = $"https://api.weixin.qq.com/sns/jscode2session" +
+              $"?appid={appId}&amp;secret={appSecret}" +
+              $"&amp;js_code={request.Code}&amp;grant_type=authorization_code";
+
+    using (var client = new HttpClient())
+    {
+        var response = await client.GetStringAsync(url);
+        var session = JsonConvert.DeserializeObject&lt;WxSession&gt;(response);
+
+        if (session.ErrCode != 0)
+            return BadRequest("code 无效或已过期");
+
+        // 用 session_key + openid 生成自定义 token
+        var token = GenerateToken(session.OpenId, session.SessionKey);
+
+        return Ok(new { token, openId = session.OpenId });
+    }
+}</code></pre>
+
+    <p>我用过一个坑：session_key 不能返回给前端。文档里写得隐晦，第一次做没注意，直接把 session_key 塞到 response 里。上线后安全审计被揪出来，session_key 泄露意味着攻击者可以解密 <code>wx.getUserInfo</code> 拿到的加密数据。正确做法是 session_key 只存在服务端缓存（Redis 或 MemoryCache），跟 openid 绑定，前端只拿 token。</p>
+
+    <p><code>wx.getUserInfo</code> 那套加密数据解密也比较绕。前端拿到 <code>encryptedData</code> 和 <code>iv</code> 后传给后端，后端用 session_key 做 AES-128-CBC 解密。Senparc 封了一层，但底层逻辑得搞清楚——不然报错"填充无效"只能干瞪眼。</p>
+
+    <pre><code class="language-csharp">var userInfo = Senparc.Weixin.MP.Helpers.EncryptHelper
+    .DecodeEncryptedData(sessionKey, encryptedData, iv);
+
+// userInfo 是 JSON 字符串，反序列化即可拿到 unionId、nickName 等
+var wxUser = JsonConvert.DeserializeObject&lt;WxUserInfo&gt;(userInfo);</code></pre>
+
+    <h2>支付：统一下单和回调的连环坑</h2>
+    <p>微信支付统一下单 API 地址是 <code>https://api.mch.weixin.qq.com/pay/unifiedorder</code>，入参是 XML 格式而非 JSON——这一点跟整个小程序的 JSON 风格格格不入。所有参数按字典排序后拼接成 key=value&amp;key=value 的字符串，末尾拼上商户 key，MD5 签名。</p>
+
+    <p>生成 prepay_id 后，返回给前端还需要二次签名。小程序调起支付的参数 <code>timeStamp</code>、<code>nonceStr</code>、<code>package</code>（格式是 prepay_id=xxx）、<code>signType</code>、<code>paySign</code>，这五个字段用同样的 MD5 方式签名。两次签名参数不同，别搞混。</p>
+
+    <pre><code class="language-csharp">private string BuildSign(SortedDictionary&lt;string, string&gt; data, string key)
+{
+    var sb = new StringBuilder();
+    foreach (var kv in data)
+    {
+        if (!string.IsNullOrEmpty(kv.Value))
+            sb.Append($"{kv.Key}={kv.Value}&amp;");
+    }
+    sb.Append($"key={key}");
+    return Md5Hash(sb.ToString()).ToUpper();
+}</code></pre>
+
+    <p>踩过最深的坑是支付回调签名验证。微信支付回调通知是一个 XML POST 到你的 notify_url，里面有个 <code>&lt;sign&gt;</code> 字段。验证流程：取出所有字段（除掉 sign 本身），按字典序拼字符串，末尾加商户 key，MD5，跟 <code>sign</code> 比对。注意字段值是 XML 标签里的原始文本，不要做任何 trim 或转义——我第一次写的时候用 <code>String.Trim()</code> 清理了一下，结果签名对不上，查了整个下午才发现是多此一举。回调处理完必须返回 XML 格式的应答报文，<code>&lt;return_code&gt;SUCCESS&lt;/return_code&gt;</code>，否则微信会重复回调。</p>
+
+    <pre><code class="language-csharp">[HttpPost]
+[Route("api/miniapp/pay/notify")]
+public IHttpActionResult PayNotify()
+{
+    var xml = Request.Content.ReadAsStringAsync().Result;
+    var notifyData = new XmlDocument();
+    notifyData.LoadXml(xml);
+
+    var sign = notifyData.SelectSingleNode("//sign")?.InnerText;
+    var data = new SortedDictionary&lt;string, string&gt;();
+    foreach (XmlNode node in notifyData.SelectSingleNode("//xml")!.ChildNodes)
+    {
+        if (node.Name != "sign" &amp;&amp; !string.IsNullOrEmpty(node.InnerText))
+            data[node.Name] = node.InnerText;
+    }
+
+    var calcSign = BuildSign(data, payKey);
+    if (calcSign != sign)
+        return Content("&lt;xml&gt;&lt;return_code&gt;FAIL&lt;/return_code&gt;&lt;/xml&gt;", "text/xml");
+
+    // 更新订单状态...
+
+    return Content("&lt;xml&gt;&lt;return_code&gt;SUCCESS&lt;/return_code&gt;&lt;/xml&gt;", "text/xml");
+}</code></pre>
+
+    <h2>模板消息推送</h2>
+    <p>模板消息是服务通知的核心渠道。用户在触发条件后、7 天内可以推送一次。调用 <code>https://api.weixin.qq.com/cgi-bin/message/wxopen/template/send?access_token=TOKEN</code>。注意 access_token 需要全局缓存，有效期 7200 秒，提前 5 分钟刷新。Senparc 的 <code>AccessTokenContainer</code> 已经做了自动管理，直接用。</p>
+
+    <pre><code class="language-csharp">var result = Senparc.Weixin.MP.AdvancedAPIs.TemplateApi
+    .SendTemplateMessage(
+        appId,                           // AppId
+        openId,                          // 接收者 openid
+        templateId,                      // 模板 ID
+        "https://mysite.com/page",       // 点击跳转
+        new
+        {
+            keyword1 = new { value = "订单已发货" },
+            keyword2 = new { value = "顺丰速运 123456789" },
+            keyword3 = new { value = DateTime.Now.ToString("yyyy-MM-dd HH:mm") }
+        }
+    );</code></pre>
+
+    <p>formId 是限量的。用户在页面里触发过一次表单提交才会产生一个 formId，跟页面模板消息不同。它有效期为 7 天，用完即废。如果业务里大量依赖模板消息，需要在前端埋好 formId 收集逻辑，每次用户交互都顺手把 formId 发到后端存起来。我用过"支付成功后通知"这个场景，刚好统一下单返回的 prepay_id 可以当 formId 用，省了一个坑。</p>
+
+    <h2>联调时的杂七杂八</h2>
+    <p>开发阶段微信要求服务器域名必须 HTTPS 且备案。本地调试用 ngrok 做内网穿透，在微信公众平台开发设置里配白名单。小程序真机调试时请求会走微信的代理，响应超时比较常见——设置 <code>HttpClient.Timeout</code> 至少 30 秒。</p>
+
+    <p>另一个坑：微信返回的 openid 是每个小程序独立的，不同小程序同一个用户的 openid 不同。要想打通账号体系需要申请开放平台，拿到 unionid。这个在业务早期可以先不管，但数据表设计时要预留 unionid 字段，避免后面迁移痛苦。</p>
+
+    <p>整体下来，ASP.NET Web API 2 搭微信小程序后端算是成熟方案。Senparc 这个库省了很多事，但支付回调那段必须自己认真写——签名验证出问题就是真金白银的损失。</p>
+  </article>
+  <script src="../assets/js/common.js"></script>
+</body>
+</html>
