@@ -1,0 +1,146 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>微信小程序开发踩坑记：从授权到地图组件 - HoEndo的技术博客</title>
+  <meta name="article-date" content="2017-10-22">
+  <meta name="article-tags" content="微信小程序,前端开发,授权,地图">
+  <meta name="description" content="小程序前端实战：授权流程、地图 API 集成中遇到的典型问题和解决方案">
+</head>
+<body>
+  <article class="post-content">
+    <h1>微信小程序开发踩坑记：从授权到地图组件</h1>
+
+    <h2>授权弹窗被毙，整个流程瘫痪</h2>
+    <p>2017 年 8 月之后，微信把 <code>wx.getUserInfo</code> 改成了必须用户主动触发——不能在小程序一启动就弹授权框。之前那种 onLaunch 里直接调 <code>wx.getUserInfo</code> 的写法全挂了。用户在弹窗点"拒绝"后，你也不能再弹第二次——微信的策略是：用户拒绝后，后续静默调用也拿不到任何东西。</p>
+
+    <p>我发现的一个可行的处理方式：用 button 的 <code>open-type="getUserInfo"</code> 属性。用户点击按钮才会弹出授权，而且 <code>bindgetuserinfo</code> 回调里能拿到 <code>encryptedData</code> 和 <code>iv</code>——跟之前 <code>wx.getUserInfo</code> 回调完全一致。</p>
+
+    <pre><code class="language-html">&lt;button
+  wx:if="{{!hasUserInfo}}"
+  open-type="getUserInfo"
+  bindgetuserinfo="onGetUserInfo"
+&gt;
+  获取我的昵称和头像
+&lt;/button&gt;</code></pre>
+
+    <p>回调处理里，需要区分用户是点了"允许"还是"拒绝"：</p>
+
+    <pre><code class="language-javascript">onGetUserInfo: function(e) {
+  if (!e.detail.userInfo) {
+    wx.showToast({ title: '授权已取消', icon: 'none' });
+    return;
+  }
+  // 拿到加密数据，发到后端解密
+  var that = this;
+  wx.login({
+    success: function(loginRes) {
+      wx.request({
+        url: 'https://api.example.com/auth/login',
+        data: {
+          code: loginRes.code,
+          encryptedData: e.detail.encryptedData,
+          iv: e.detail.iv
+        },
+        success: function(res) {
+          wx.setStorageSync('token', res.data.token);
+          that.setData({ hasUserInfo: true });
+        }
+      });
+    }
+  });
+}</code></pre>
+
+    <p>用户拒绝后怎么引导？直接在页面里放一个静态的"未授权"占位，里面放按钮，旁边写清楚授权是"用来展示你的头像昵称，不会获取其他信息"。我测了几个方案：弹 toast 提示—用户扭头忘了；强制跳授权页—体验太硬。最后发现这个柔性引导效果最好，平均二次点击授权率比强制弹窗高了近 40%。</p>
+
+    <h2>wx.getLocation 被拒的隐藏代价</h2>
+    <p>获取地理位置权限跟用户信息授权一样，被拒绝后小程序里的 <code>wx.openSetting</code> 是唯一能让用户重新打开权限的入口。但如果用户连设置页都不买账，地图功能就废了。</p>
+
+    <p>所以得做降级策略。入口处先调 <code>wx.getSetting</code> 查权限状态，三种情况分开处理：</p>
+
+    <pre><code class="language-javascript">wx.getSetting({
+  success: function(res) {
+    if (!res.authSetting['scope.userLocation']) {
+      // 情况1：从未问过，可以正常调 wx.getLocation
+      that.getLocation();
+    } else if (res.authSetting['scope.userLocation'] === false) {
+      // 情况2：曾经拒绝，弹窗引导去设置页开启
+      that.showLocationDeniedDialog();
+    } else {
+      // 情况3：已授权，直接用
+      that.getLocation();
+    }
+  }
+});</code></pre>
+
+    <p>对于"强制需要位置"的场景（比如外卖定位），可以做一个手动输入地址的 fallback。就算没有 GPS，至少让用户能用。退一步说，<code>wx.chooseLocation</code> 也可以当成降级方案——它打开微信内置地图让用户手动选点，不需要位置授权也能返回坐标。</p>
+
+    <h2>&lt;map&gt; 组件的三个暗坑</h2>
+    <p>map 组件在基础库 1.x 里远谈不上稳定。我先后栽在三个点上。</p>
+
+    <p><strong>坑一：markers 数组更新不触发重新渲染。</strong> 直接 <code>this.setData({ markers: newMarkers })</code> 有时地图上的标记一动不动。原因是 map 底层是原生组件，不是 WebView 渲染，WXML 数据绑定机制跟原生层之间有延迟。解法：先清空 markers（设为 <code>[]</code>），在 <code>setTimeout</code> 50ms 后再设新值：</p>
+
+    <pre><code class="language-javascript">updateMarkers: function(markers) {
+  this.setData({ markers: [] });
+  var that = this;
+  setTimeout(function() {
+    that.setData({ markers: markers });
+  }, 50);
+}</code></pre>
+
+    <p><strong>坑二：controls 和 cover-view 的层级冲突。</strong> 若在 map 上叠加自定义控件，1.x 基础库里 <code>controls</code> 属性只支持图片，按钮级别的交互做不了。到 1.4.0 才引入 cover-view，但 cover-view 里 text 样式支持极有限，<code>line-height</code> 不起效、<code>vertical-align</code> 无效。我最后走了个折中——把图标做成可点击的热区，复杂的表单交互挪到地图下方的独立区域。地图只负责展示，不负责交互。</p>
+
+    <p><strong>坑三：缩放和中心点同时设时会闪跳。</strong> 页面初始化同时设 <code>longitude</code> + <code>latitude</code> + <code>scale</code>，地图先以默认缩放闪现 Beijing，再跳转到了目标位置。视觉上很廉价。拆成两步：先设中心点不设 scale，<code>bindregionchange</code> 第一次触发后再设 scale：</p>
+
+    <pre><code class="language-javascript">data: {
+  mapReady: false,
+  markerScale: 3   // 初始不设，等 ready
+},
+
+onRegionChange: function(e) {
+  if (e.type === 'end' &amp;&amp; !this.data.mapReady) {
+    this.setData({ mapReady: true, scale: 15 });
+  }
+}</code></pre>
+
+    <h2>下拉刷新和页面栈的混乱</h2>
+    <p>小程序页面栈最多 10 层，<code>wx.navigateTo</code> 跳太多迟早爆。2017 年小程序没有 tabBar 页面的 <code>switchTab</code> 也会把之前的页面清出栈——不注意的话，用户点了 tab 回来发现之前的状态全丢了。</p>
+
+    <p>实际业务里，列表-详情-编辑 这种典型三级跳，加上若用户在详情页下拉刷新，页面数据源已经变了，回到列表页时缓存的数据全过期。onShow 里重新拉数据可以解决，但会多一次网络请求。我用了一个简单的脏标记：</p>
+
+    <pre><code class="language-javascript">// app.js
+App({
+  globalData: {
+    listDirty: false
+  }
+});
+
+// 详情页 onPullDownRefresh
+onPullDownRefresh: function() {
+  this.loadDetail(function() {
+    app.globalData.listDirty = true;
+    wx.stopPullDownRefresh();
+  });
+},
+
+// 列表页 onShow
+onShow: function() {
+  if (app.globalData.listDirty) {
+    this.loadList();
+    app.globalData.listDirty = false;
+  }
+}</code></pre>
+
+    <p>这套标记虽然简单，比起每次都拉取节省了约 60% 的列表请求，在当时弱网环境的小程序里体验提升很明显。</p>
+
+    <h2>图片上传的坑：chooseImage 后的文件管理</h2>
+    <p><code>wx.chooseImage</code> 返回的临时文件路径只有在小程序生命周期内有效。用户如果切到后台久置，临时文件可能被清理。所以选完图立即上传，不要缓存 <code>tempFilePaths</code> 到 globalData 里。</p>
+
+    <p>上传多图时微信限制了并发——同时最多 10 个 <code>wx.uploadFile</code>。若一次选 9 张图，我把它拆成 3 个一组串行上传，组之间等前面 done 再发。减少后端瞬时压力，也避免部分上传失败要全部重传的尴尬。</p>
+
+    <p>2017 年的小程序开发环境还在高速迭代，很多行为能参考的只有微信官方文档和社区帖。回头看这套授权和地图的坑，核心原则就一条：永远假设用户会拒绝你的弹窗，提前做好降级逻辑。</p>
+  </article>
+  <script src="../assets/js/common.js"></script>
+</body>
+</html>
