@@ -1,0 +1,173 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>.NET Core 2.1 + Vue CLI 全栈项目搭建 - HoEndo的技术博客</title>
+  <meta name="article-date" content="2018-03-10">
+  <meta name="article-tags" content=".NET Core,Vue.js,全栈开发,Webpack">
+  <meta name="description" content="从零搭建 .NET Core 2.1 后端 + Vue 前端 SPA 项目，前后端分离架构">
+</head>
+<body>
+  <article class="post-content">
+    <h1>.NET Core 2.1 + Vue CLI 全栈项目搭建</h1>
+
+    <h2>为什么会走到前后端分离</h2>
+    <p>2018 年初我手上维护的那个 ASP.NET MVC 项目，前端业务逻辑全搅在 Razor 视图和 jQuery 里，一个页面可能有 800 行的 <code>$(function(){ ... })</code>，改一个表单字段要在三个 cshtml 之间来回跳。正好 .NET Core 2.1 Preview 发布，带上了 SignalR 和 Razor Class Libraries，公司决定新项目用前后端分离的模式重写。</p>
+
+    <p>选 Vue 没选 React 的原因很实际：Vue 的中文文档质量高，团队里后端转前端的同事上手快。Vue CLI 3.0-rc 刚出，webpack 配置全部收敛到 <code>vue.config.js</code>，比以前手改 webpack.config 舒服得多。</p>
+
+    <h2>后端：.NET Core 2.1 Web API 骨架</h2>
+    <p>用 <code>dotnet new webapi</code> 初始化项目，出来的控制器默认是 <code>[Route("api/[controller]")]</code> 风格。保留 Controller 只做路由和参数校验，业务逻辑全抽到 Service 层。</p>
+
+    <pre><code class="language-bash">dotnet new webapi -n MyApp.Api --no-https
+cd MyApp.Api
+dotnet add package Microsoft.EntityFrameworkCore.SqlServer
+dotnet add package Microsoft.AspNetCore.Cors</code></pre>
+
+    <p>Startup.cs 里需要配 CORS，开发阶段前端跑在 <code>localhost:8080</code>，后端在 <code>localhost:5000</code>，跨域是绕不开的。我推荐用命名策略而不是通配 <code>*</code>：</p>
+
+    <pre><code class="language-csharp">// Startup.cs ConfigureServices
+services.AddCors(options =&gt;
+{
+    options.AddPolicy("Dev", builder =&gt;
+        builder.WithOrigins("http://localhost:8080")
+               .AllowAnyHeader()
+               .AllowAnyMethod());
+});
+
+// Configure
+app.UseCors("Dev");</code></pre>
+
+    <p>JSON 序列化默认是 camelCase，Vue 前端返回的字段也是驼峰——这点刚好对齐。但如果数据库字段用 PascalCase（传统 .NET 习惯），可以在 <code>AddMvc()</code> 里配置：</p>
+
+    <pre><code class="language-csharp">services.AddMvc()
+    .AddJsonOptions(opt =&gt;
+    {
+        opt.SerializerSettings.ContractResolver =
+            new CamelCasePropertyNamesContractResolver();
+    });</code></pre>
+
+    <h2>前端：Vue CLI 3.0-rc 的项目初始化</h2>
+    <p>Vue CLI 3 的核心变化是 <code>vue create</code> 替代 <code>vue init webpack</code>，交互式选择 Babel、Router、Vuex、CSS pre-processor 等插件。我习惯勾上 Vue Router + Vuex + SCSS，开箱即用。</p>
+
+    <pre><code class="language-bash">npm install -g @vue/cli@3.0.0-rc.5
+vue create myapp-client
+cd myapp-client
+vue add axios</code></pre>
+
+    <p>项目结构出来大概是 <code>src/views/</code> 放页面级组件、<code>src/components/</code> 放可复用组件、<code>src/store/</code> 放 Vuex modules、<code>src/api/</code> 统一放 axios 请求封装。</p>
+
+    <p>开发代理是前后端分离的第一步关键配置。在项目根目录加 <code>vue.config.js</code>：</p>
+
+    <pre><code class="language-javascript">module.exports = {
+  devServer: {
+    port: 8080,
+    proxy: {
+      '/api': {
+        target: 'http://localhost:5000',
+        changeOrigin: true
+      }
+    }
+  }
+};</code></pre>
+
+    <p>这样前端所有 <code>/api/*</code> 请求会被 dev server 转发到 .NET Core 后端，不需要后端配 CORS。但 proxy 只解决开发环境问题——生产环境你仍然需要 CORS 或者 nginx 反代把前后端放在同一个域下。</p>
+
+    <h2>axios 封装和 token 管理</h2>
+    <p>统一封装 axios instance 是必定要做的。加 request interceptor 注入 token，加 response interceptor 统一处理 401：</p>
+
+    <pre><code class="language-javascript">// src/api/http.js
+import axios from 'axios';
+import router from '@/router';
+
+const service = axios.create({
+  baseURL: '/api',
+  timeout: 15000
+});
+
+service.interceptors.request.use(config =&gt; {
+  const token = localStorage.getItem('token');
+  if (token) {
+    config.headers.Authorization = `Bearer ${token}`;
+  }
+  return config;
+});
+
+service.interceptors.response.use(
+  response =&gt; response.data,
+  error =&gt; {
+    if (error.response &amp;&amp; error.response.status === 401) {
+      localStorage.removeItem('token');
+      router.push('/login');
+    }
+    return Promise.reject(error);
+  }
+);
+
+export default service;</code></pre>
+
+    <p>Vuex 里按模块拆分，每个 domain 一个 module 文件。store 不应该直接调 axios，而是通过 <code>src/api/</code> 下的方法间接调用——这样单元测试 mock 更干净。</p>
+
+    <h2>JWT 认证的来回</h2>
+    <p>.NET Core 2.1 内置 JWT 支持不需要额外装包。在 <code>ConfigureServices</code> 里配置认证：</p>
+
+    <pre><code class="language-csharp">services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
+    .AddJwtBearer(options =&gt;
+    {
+        options.TokenValidationParameters = new TokenValidationParameters
+        {
+            ValidateIssuer = true,
+            ValidateAudience = true,
+            ValidateLifetime = true,
+            ValidateIssuerSigningKey = true,
+            ValidIssuer = Configuration["Jwt:Issuer"],
+            ValidAudience = Configuration["Jwt:Audience"],
+            IssuerSigningKey = new SymmetricSecurityKey(
+                Encoding.UTF8.GetBytes(Configuration["Jwt:Key"]))
+        };
+    });</code></pre>
+
+    <p>Controller 上加 <code>[Authorize]</code> 即可。登录接口返回的 token 格式：</p>
+
+    <pre><code class="language-csharp">var claims = new[]
+{
+    new Claim(ClaimTypes.NameIdentifier, user.Id.ToString()),
+    new Claim(ClaimTypes.Name, user.UserName),
+    new Claim(ClaimTypes.Role, user.Role)
+};
+
+var key = new SymmetricSecurityKey(
+    Encoding.UTF8.GetBytes(_config["Jwt:Key"]));
+var creds = new SigningCredentials(key, SecurityAlgorithms.HmacSha256);
+
+var token = new JwtSecurityToken(
+    issuer: _config["Jwt:Issuer"],
+    audience: _config["Jwt:Audience"],
+    claims: claims,
+    expires: DateTime.Now.AddHours(8),
+    signingCredentials: creds);
+
+return Ok(new { token = new JwtSecurityTokenHandler().WriteToken(token) });</code></pre>
+
+    <p>前端收到 token 存 <code>localStorage</code>，axios interceptor 自动带上。需要注意的是 token 过期后的处理：我碰见过好几次接口突然报 401，排查发现是前后端时间有偏差导致 token 提前失效。生产环境走 NTP 对时可以避免。</p>
+
+    <h2>联调和发布</h2>
+    <p>开发阶段前端 <code>npm run serve</code> + 后端 <code>dotnet run</code> 并行工作。联调问题时通常先看 Network 面板确认请求到底发出了没、状态码是什么。</p>
+
+    <p>生产发布有两种选择。方案 A：前端 <code>npm run build</code> 产出 <code>dist/</code>，后端用 <code>app.UseStaticFiles()</code> 直接 serve 这些静态文件，适合简单部署。方案 B：前端单独部署到 nginx 或 CDN，适合流量大、需要独立扩容的场景。我项目体量不大，用了方案 A：</p>
+
+    <pre><code class="language-csharp">app.UseStaticFiles();
+app.UseMvc(routes =&gt;
+{
+    routes.MapSpaFallbackRoute("spa-fallback",
+        new { controller = "Home", action = "Index" });
+});</code></pre>
+
+    <p>把所有非 API 请求 fallback 到 <code>index.html</code>，Vue Router 的 HTML5 History 模式就能正常工作。</p>
+
+    <p>从传统 ASP.NET 跳到 .NET Core + Vue 前后端分离，初期配环境确实多花了两天时间，但代码结构清晰了不是一点半点。后端专注数据，前端专注 UI，接口约定好之后两边几乎不用相互等——这在之前混在一起的 Razor 项目里是不可想象的。</p>
+  </article>
+  <script src="../assets/js/common.js"></script>
+</body>
+</html>

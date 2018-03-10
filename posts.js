@@ -1,6 +1,18 @@
 var POSTS_DATA = 
 [
   {
+    "title": ".NET Core 2.1 + Vue CLI 全栈项目搭建",
+    "slug": "2018-03-10-dotnet-core-vue-fullstack-setup",
+    "date": "2018-03-10",
+    "tags": [
+      ".NET Core",
+      "Vue.js",
+      "全栈开发",
+      "Webpack"
+    ],
+    "summary": "从零搭建 .NET Core 2.1 后端 + Vue 前端 SPA 项目，前后端分离架构"
+  },
+  {
     "title": "微信小程序开发踩坑记：从授权到地图组件",
     "slug": "2017-10-22-wechat-miniapp-auth-map-pitfalls",
     "date": "2017-10-22",
