@@ -1,0 +1,213 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Vue 组件化实战：后台管理系统的表格与表单封装 - HoEndo的技术博客</title>
+  <meta name="article-date" content="2018-07-18">
+  <meta name="article-tags" content="Vue.js,Element UI,组件化,后台管理">
+  <meta name="description" content="基于 Element UI 封装可复用的表格和动态表单组件，实现权限驱动的后台管理界面">
+</head>
+<body>
+  <article class="post-content">
+    <h1>Vue 组件化实战：后台管理系统的表格与表单封装</h1>
+
+    <h2>场景：表单的"复制粘贴"地狱</h2>
+    <p>项目做到第四个模块的时候，我有八个页面各有一张表单。每张表单结构不一样——字段不同、校验规则不同、布局也有差异——但外层逻辑高度重复：打开弹窗、绑定数据、提交前校验、关闭时清空、提交 loading 状态、错误提示。八个页面的八个表单，代码加起来超过 3000 行，其中 70% 是重复的模板和逻辑。</p>
+
+    <p>改一个通用行为——比如全局把提交按钮从右对齐改成居中——要改八个地方。这种事一多，迟早改漏一个。所以必须得把表单抽象成组件。</p>
+
+    <h2>设计思路：配置驱动 vs 插槽自由</h2>
+    <p>有两种极端。一种是全配置驱动：传一个 JSON 描述字段列表，组件内部根据配置 v-for 渲染所有表单项。好处是复用性极强，缺点是复杂交互（比如联动下拉、自定义字段排列）需要去组件内部写 case，变成配置的配置，可读性崩坏。</p>
+
+    <p>另一种是壳子组件+默认插槽：只提供表单容器（弹窗、loading、按钮区），字段完全由父组件用插槽填充。灵活性最高，但每个页面仍然要手写所有字段的 el-form-item，外层逻辑照样重复。</p>
+
+    <p>我折中了一下：字段用配置渲染，但预留插槽给特殊字段；增/改共用一个组件，由 <code>mode</code> prop 区分。</p>
+
+    <h2>表单组件的 props 设计</h2>
+
+    <pre><code class="language-javascript">props: {
+  // 表单字段配置数组
+  fields: {
+    type: Array,
+    required: true
+    // 每个 field 对象: { prop, label, type, rules, options, disabled, span }
+  },
+  // 模式: 'create' | 'edit'
+  mode: {
+    type: String,
+    default: 'create',
+    validator: v =&gt; ['create', 'edit'].includes(v)
+  },
+  // 编辑时的回填数据
+  formData: {
+    type: Object,
+    default: () =&gt; ({})
+  },
+  // 弹窗可见性
+  visible: {
+    type: Boolean,
+    default: false
+  }
+}</code></pre>
+
+    <p>字段 type 支持 <code>input</code>、<code>select</code>、<code>datepicker</code>、<code>switch</code>、<code>textarea</code>、<code>upload</code> 六种。对多数后台表单来说够用。遇到不够用的——比如需要级联选择器——加一个 <code>custom</code> 类型，渲染时走具名插槽：</p>
+
+    <pre><code class="language-html">&lt;template v-for="field in fields"&gt;
+  &lt;el-form-item
+    v-if="field.type !== 'custom'"
+    :key="field.prop"
+    :label="field.label"
+    :prop="field.prop"
+    :rules="field.rules"
+  &gt;
+    &lt;el-input
+      v-if="field.type === 'input'"
+      v-model="localForm[field.prop]"
+      :disabled="field.disabled"
+    /&gt;
+    &lt;el-select
+      v-else-if="field.type === 'select'"
+      v-model="localForm[field.prop]"
+    &gt;
+      &lt;el-option
+        v-for="opt in field.options"
+        :key="opt.value"
+        :label="opt.label"
+        :value="opt.value"
+      /&gt;
+    &lt;/el-select&gt;
+    &lt;!-- 更多 type 分支 --&gt;
+  &lt;/el-form-item&gt;
+  &lt;el-form-item
+    v-else
+    :key="field.prop"
+    :label="field.label"
+  &gt;
+    &lt;slot :name="field.prop" :value="localForm[field.prop]" /&gt;
+  &lt;/el-form-item&gt;
+&lt;/template&gt;</code></pre>
+
+    <h2>表单组件的核心逻辑</h2>
+    <p>弹窗打开时，如果是编辑模式要把 <code>formData</code> 深拷贝到内部 <code>localForm</code>，防止直接修改 prop 导致父组件数据意外变更。关闭时重置 <code>localForm</code> 为空对象，同时调用 <code>el-form.resetFields()</code> 清掉校验状态。</p>
+
+    <pre><code class="language-javascript">watch: {
+  visible(val) {
+    if (val) {
+      this.localForm = JSON.parse(JSON.stringify(this.formData || {}));
+      this.$nextTick(() =&gt; {
+        if (this.$refs.form) this.$refs.form.clearValidate();
+      });
+    }
+  },
+  mode() {
+    // 切换模式时重置表单
+    this.localForm = {};
+  }
+},
+
+methods: {
+  handleSubmit() {
+    this.$refs.form.validate(valid =&gt; {
+      if (!valid) return;
+      this.$emit('submit', {
+        mode: this.mode,
+        data: JSON.parse(JSON.stringify(this.localForm))
+      });
+    });
+  },
+  handleClose() {
+    this.localForm = {};
+    this.$refs.form.resetFields();
+    this.$emit('update:visible', false);
+  }
+}</code></pre>
+
+    <p>父组件使用的时候，只需要传 fields 配置和处理 submit 事件：</p>
+
+    <pre><code class="language-html">&lt;form-dialog
+  :visible.sync="dialogVisible"
+  :mode="dialogMode"
+  :fields="userFields"
+  :form-data="currentUser"
+  @submit="onUserSubmit"
+/&gt;</code></pre>
+
+    <pre><code class="language-javascript">data() {
+  return {
+    userFields: [
+      { prop: 'userName', label: '用户名', type: 'input',
+        rules: [{ required: true, message: '必填' }] },
+      { prop: 'role', label: '角色', type: 'select',
+        options: [{ label: '管理员', value: 'admin' },
+                   { label: '编辑', value: 'editor' }] },
+      { prop: 'status', label: '状态', type: 'switch' }
+    ]
+  };
+}</code></pre>
+
+    <p>八套表单缩减到一套组件，字段用 JSON 配置描述。改表单行为只改组件内部一处理，全局生效。新增模块只需要写 fields 数组，页面代码从 ~250 行降到 ~80 行。</p>
+
+    <h2>表格封装：保持一致性和权限控制</h2>
+    <p>跟表单的问题类似：每个后台列表页一张 el-table，列定义、分页、多选、操作栏全在模板里重复。更麻烦的是权限控制——管理员能看到操作列里的"删除"按钮，普通编辑不能。之前权限判断散落在每个页面的 <code>v-if</code> 里，检查起来费劲。</p>
+
+    <p>封装的思路：列配置数组传给组件，操作列单独用一个 <code>actions</code> prop，每个 action 带 <code>permission</code> 字段，组件内部全局过滤：</p>
+
+    <pre><code class="language-javascript">props: {
+  columns: Array,
+  data: Array,
+  loading: Boolean,
+  pagination: Object,
+  actions: {
+    type: Array,
+    default: () => []
+    // 每项: { label, type, permission, handler }
+  }
+},
+
+computed: {
+  visibleActions() {
+    const permissions = this.$store.state.user.permissions || [];
+    return this.actions.filter(
+      a =&gt; !a.permission || permissions.includes(a.permission)
+    );
+  }
+}</code></pre>
+
+    <p>使用方代码变得极简：</p>
+
+    <pre><code class="language-html">&lt;data-table
+  :columns="columns"
+  :data="list"
+  :loading="loading"
+  :pagination="pagination"
+  :actions="tableActions"
+  @page-change="onPageChange"
+  @action="onAction"
+/&gt;</code></pre>
+
+    <pre><code class="language-javascript">tableActions: [
+  { label: '编辑', type: 'primary', action: 'edit',
+    permission: 'user:update' },
+  { label: '删除', type: 'danger', action: 'delete',
+    permission: 'user:delete' }
+]</code></pre>
+
+    <p>权限配置集中在 Vuex 的 user module 里维护，接口返回权限列表后存 store。表格组件从 store 读，不做独立请求——省 N 次不必要的权限接口调用。</p>
+
+    <h2>搜索栏的递进式封装</h2>
+    <p>后台列表大多带搜索栏。八个列表页的搜索栏结构各不相同但交互模式一致：若干筛选项 + 搜索按钮 + 重置按钮，按钮触发时可能是回车也可能是点击。</p>
+
+    <p>抽一个 <code>SearchBar</code> 组件，props 收 <code>filters</code> 数组（和表单 fields 结构类似），点击搜索 emit <code>search</code> 事件带出所有筛选值。这样列表页面结构稳定成三段：</p>
+
+    <pre><code class="language-html">&lt;search-bar :filters="searchFilters" @search="onSearch" /&gt;
+&lt;data-table :columns="columns" :data="list" :actions="actions" /&gt;
+&lt;form-dialog :visible.sync="visible" :fields="formFields" @submit="onSubmit" /&gt;</code></pre>
+
+    <p>一个后台模块的基础骨架就这么固定下来。新增模块只需要提供三组配置：<code>searchFilters</code>、<code>columns</code>、<code>formFields</code>，以及对应的 API 调用方法。开发效率从两天一个模块提速到半天。</p>
+
+    <p>Element UI 2.4 当时刚出稳定版，iView 是主要竞品，我选 Element 的原因是表单校验 <code>async-validator</code> 集成更丝滑、table 的 fixed 列支持也更成熟。这套封装方案在三个后台项目里跑了大半年，后面只是随着业务新增了一些 field type，组件本体几乎没有大改。</p>
+  </article>
+  <script src="../assets/js/common.js"></script>
+</body>
+</html>

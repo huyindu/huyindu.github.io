@@ -1,6 +1,18 @@
 var POSTS_DATA = 
 [
   {
+    "title": "Vue 组件化实战：后台管理系统的表格与表单封装",
+    "slug": "2018-07-18-vue-component-table-form-management",
+    "date": "2018-07-18",
+    "tags": [
+      "Vue.js",
+      "Element UI",
+      "组件化",
+      "后台管理"
+    ],
+    "summary": "基于 Element UI 封装可复用的表格和动态表单组件，实现权限驱动的后台管理界面"
+  },
+  {
     "title": ".NET Core 2.1 + Vue CLI 全栈项目搭建",
     "slug": "2018-03-10-dotnet-core-vue-fullstack-setup",
     "date": "2018-03-10",
