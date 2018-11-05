@@ -1,0 +1,250 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>ASP.NET Core 中间件管道详解 - HoEndo的技术博客</title>
+  <meta name="article-date" content="2018-11-05">
+  <meta name="article-tags" content="ASP.NET Core,中间件,管道,.NET Core">
+  <meta name="description" content="深入 ASP.NET Core 中间件管道原理，手写自定义中间件实现异常处理和请求日志">
+</head>
+<body>
+  <article class="post-content">
+    <h1>ASP.NET Core 中间件管道详解</h1>
+
+    <h2>线上 500 的起因</h2>
+    <p>迁移到 .NET Core 2.1 的头两个月，运维隔三差五发来截图：某个接口在凌晨两点半返回了 500。翻日志只看到 <code>Internal Server Error</code>，没有堆栈、没有请求体、没有上下文——排查完全靠猜。</p>
+
+    <p>根源在于旧代码里的 <code>try-catch</code> 覆盖不全。Controller Action 里某些分支没有包异常处理，异常一路冒泡到框架层，框架返回了空白的 500。.NET Core 不像传统 ASP.NET 有 <code>Application_Error</code> 全局事件，想兜底必须写自定义中间件。</p>
+
+    <h2>中间件的本质：一个 RequestDelegate</h2>
+    <p>ASP.NET Core 的请求处理管道由一段段中间件串联而成。每个中间件是一个委托，签名为：</p>
+
+    <pre><code class="language-csharp">public delegate Task RequestDelegate(HttpContext context);</code></pre>
+
+    <p>中间件拿到 <code>HttpContext</code>，做事情，调用 <code>next(context)</code> 把请求交给管道里的下一个中间件。调用 <code>next</code> 之前是请求进入阶段，之后是响应离开阶段——这是一个双向管道。</p>
+
+    <p>最简单的中间件写法就是 <code>app.Use(async (context, next) => { ... })</code>，但真正可复用的需要封装成类。</p>
+
+    <h2>手写全局异常处理中间件</h2>
+    <p>需求明确：捕获所有未处理异常，记录完整上下文（请求方法、路径、body、query string、当前用户），返回统一的 JSON 错误响应而不是空白 500。</p>
+
+    <pre><code class="language-csharp">public class GlobalExceptionMiddleware
+{
+    private readonly RequestDelegate _next;
+    private readonly ILogger&lt;GlobalExceptionMiddleware&gt; _logger;
+
+    public GlobalExceptionMiddleware(
+        RequestDelegate next,
+        ILogger&lt;GlobalExceptionMiddleware&gt; logger)
+    {
+        _next = next;
+        _logger = logger;
+    }
+
+    public async Task InvokeAsync(HttpContext context)
+    {
+        try
+        {
+            await _next(context);
+        }
+        catch (Exception ex)
+        {
+            await HandleExceptionAsync(context, ex);
+        }
+    }
+
+    private async Task HandleExceptionAsync(
+        HttpContext context, Exception exception)
+    {
+        var requestBody = string.Empty;
+        context.Request.EnableBuffering();
+        context.Request.Body.Position = 0;
+        using (var reader = new StreamReader(
+            context.Request.Body, Encoding.UTF8,
+            detectEncodingFromByteOrderMarks: false,
+            bufferSize: 1024, leaveOpen: true))
+        {
+            requestBody = await reader.ReadToEndAsync();
+            context.Request.Body.Position = 0;
+        }
+
+        _logger.LogError(exception,
+            "未处理异常 | Path: {Path} | Method: {Method} " +
+            "| Query: {Query} | Body: {Body} | User: {User}",
+            context.Request.Path,
+            context.Request.Method,
+            context.Request.QueryString,
+            requestBody,
+            context.User?.Identity?.Name ?? "anonymous");
+
+        context.Response.StatusCode = 500;
+        context.Response.ContentType = "application/json";
+
+        var response = new
+        {
+            code = 500,
+            message = IsDevelopment(context)
+                ? exception.Message
+                : "服务器内部错误，请稍后重试"
+        };
+
+        await context.Response.WriteAsync(
+            JsonConvert.SerializeObject(response));
+    }
+
+    private bool IsDevelopment(HttpContext context)
+    {
+        var env = context.RequestServices
+            .GetService&lt;IHostingEnvironment&gt;();
+        return env.IsDevelopment();
+    }
+}</code></pre>
+
+    <p>有一个细节容易漏掉：<code>context.Request.EnableBuffering()</code>。默认情况下请求 body 是只读的 forward-only stream，读过一次就无法回头。中间件里如果要在 <code>catch</code> 块里读 body，必须提前 enable buffering。另外 <code>context.Request.Body.Position = 0</code> 重置 stream 位置也很关键——否则下游的 Model Binding 读不到 body 会报空参数。</p>
+
+    <p>注册中间件用扩展方法，放到 Startup.cs 管道的<strong>最前面</strong>——这样才能包住后面所有中间件：</p>
+
+    <pre><code class="language-csharp">public static class GlobalExceptionMiddlewareExtensions
+{
+    public static IApplicationBuilder UseGlobalException(
+        this IApplicationBuilder builder)
+    {
+        return builder.UseMiddleware&lt;GlobalExceptionMiddleware&gt;();
+    }
+}
+
+// Startup.cs Configure
+app.UseGlobalException();   // 第一个，包住所有下游
+app.UseAuthentication();
+app.UseMvc();</code></pre>
+
+    <h2>请求日志中间件：不止是写一行日志</h2>
+    <p>异常中间件兜底了 crash，但行为日志仍然缺位。我需要知道：每个请求花了多少毫秒、返回的状态码是什么、token 解析出来的用户是谁。特别是一些慢接口——需要日志里直接体现耗时，而不是事后去 APM 系统里查。</p>
+
+    <pre><code class="language-csharp">public class RequestLogMiddleware
+{
+    private readonly RequestDelegate _next;
+    private readonly ILogger&lt;RequestLogMiddleware&gt; _logger;
+
+    public RequestLogMiddleware(
+        RequestDelegate next,
+        ILogger&lt;RequestLogMiddleware&gt; logger)
+    {
+        _next = next;
+        _logger = logger;
+    }
+
+    public async Task InvokeAsync(HttpContext context)
+    {
+        var sw = Stopwatch.StartNew();
+        await _next(context);
+        sw.Stop();
+
+        var statusCode = context.Response.StatusCode;
+        var elapsed = sw.ElapsedMilliseconds;
+
+        if (statusCode >= 400 || elapsed > 3000)
+        {
+            _logger.LogWarning(
+                "Request | {Method} {Path} => {StatusCode} ({Elapsed}ms) [{User}]",
+                context.Request.Method,
+                context.Request.Path + context.Request.QueryString,
+                statusCode,
+                elapsed,
+                context.User?.Identity?.Name ?? "anonymous");
+            return;
+        }
+
+        _logger.LogInformation(
+            "Request | {Method} {Path} => {StatusCode} ({Elapsed}ms)",
+            context.Request.Method,
+            context.Request.Path,
+            statusCode,
+            elapsed);
+    }
+}</code></pre>
+
+    <p>用了两个阈值：状态码 ≥ 400 或者耗时 > 3000ms 走 Warning 级别，其余走 Information。生产环境 Info 量太大可以关掉，但 Warning 级别的异常请求和慢请求必定记录。</p>
+
+    <p>这个中间件放的位置跟异常中间件不同：应该放在认证中间件<strong>之后</strong>，否则 <code>context.User</code> 还是空的，日志里见不到真实用户。</p>
+
+    <pre><code class="language-csharp">app.UseGlobalException();
+app.UseAuthentication();
+app.UseRequestLog();  // 认证之后，MVC 之前
+app.UseMvc();</code></pre>
+
+    <h2>分支管道与条件中间件</h2>
+    <p><code>app.Map</code> 可以在特定路径前缀上接一段独立管道。比如某个路径下的接口需要额外的请求头校验，完全不用侵入主管道：</p>
+
+    <pre><code class="language-csharp">app.Map("/admin", adminApp =&gt;
+{
+    adminApp.UseMiddleware&lt;AdminAuthMiddleware&gt;();
+    adminApp.UseMvc();
+});
+
+app.Map("/api", apiApp =&gt;
+{
+    apiApp.UseMiddleware&lt;ApiVersionMiddleware&gt;();
+    apiApp.UseMvc();
+});</code></pre>
+
+    <p><code>MapWhen</code> 更灵活，基于 <code>HttpContext</code> 的条件动态分支：</p>
+
+    <pre><code class="language-csharp">app.MapWhen(
+    ctx =&gt; ctx.Request.Headers.ContainsKey("X-Debug"),
+    debugApp =&gt;
+    {
+        debugApp.UseMiddleware&lt;DebugInfoMiddleware&gt;();
+    });</code></pre>
+
+    <p>这招在排查线上问题时很有用——带上 <code>X-Debug: 1</code> 请求头就能看到额外的诊断信息，不污染正常请求日志。</p>
+
+    <h2>管道的短路与短路代价</h2>
+    <p>中间件可以直接响应而不调用 <code>next</code>——这叫短路（short-circuit）。典型的比如 CORS 中间件对 OPTIONS 预检请求直接返回 204。但短路也有坑：如果你在短路前没有正确处理 response 的 headers 和 status code，浏览器收到的会是一个不完整的响应。</p>
+
+    <p>自定义短路一个例子——IP 白名单：</p>
+
+    <pre><code class="language-csharp">public class IpWhitelistMiddleware
+{
+    private readonly RequestDelegate _next;
+    private readonly HashSet&lt;string&gt; _allowedIps;
+
+    public IpWhitelistMiddleware(
+        RequestDelegate next, IConfiguration config)
+    {
+        _next = next;
+        _allowedIps = config.GetSection("IpWhitelist")
+            .Get&lt;HashSet&lt;string&gt;&gt;() ?? new HashSet&lt;string&gt;();
+    }
+
+    public async Task InvokeAsync(HttpContext context)
+    {
+        var remoteIp = context.Connection.RemoteIpAddress?.ToString();
+
+        if (!_allowedIps.Contains(remoteIp))
+        {
+            context.Response.StatusCode = 403;
+            context.Response.ContentType = "application/json";
+            await context.Response.WriteAsync(
+                "{\"code\":403,\"message\":\"IP 未授权\"}");
+            return;  // 短路，不调 _next
+        }
+
+        await _next(context);
+    }
+}</code></pre>
+
+    <h2>Middleware 的执行顺序是 Bug 的温床</h2>
+    <p>曾上过线的一个故障：静态文件中间件放在了认证中间件之前。于是未登录用户可以直接访问 <code>/uploads/</code> 下面的所有文件——包括用户的身份证照片。正确的顺序是先把需要保护的路径放到认证之后，或者至少用 <code>MapWhen</code> 区分公开资源和受保护资源。</p>
+
+    <p>管道顺序总结：</p>
+
+    <pre><code class="language-bash">异常处理 → 强制HTTPS → 静态文件(公开) → 认证 →
+授权 → 请求日志 → 自定义业务中间件 → MVC/Endpoint</code></pre>
+
+    <p>自定义异常处理和请求日志两个中间件上线后，运维再也没有发过"不明 500"的截图。日志里有了完整堆栈和请求上下文，定位问题从小时级缩到分钟级。中间件机制是 ASP.NET Core 最值得花时间吃透的特性——它本质上就是把 HTTP 处理的横切关注点从 MVC 框架里剥离了出去，单独测试、单独部署、单独演进。</p>
+  </article>
+  <script src="../assets/js/common.js"></script>
+</body>
+</html>

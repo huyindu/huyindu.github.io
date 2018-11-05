@@ -1,6 +1,18 @@
 var POSTS_DATA = 
 [
   {
+    "title": "ASP.NET Core 中间件管道详解",
+    "slug": "2018-11-05-aspnetcore-middleware-pipeline",
+    "date": "2018-11-05",
+    "tags": [
+      "ASP.NET Core",
+      "中间件",
+      "管道",
+      ".NET Core"
+    ],
+    "summary": "深入 ASP.NET Core 中间件管道原理，手写自定义中间件实现异常处理和请求日志"
+  },
+  {
     "title": "Vue 组件化实战：后台管理系统的表格与表单封装",
     "slug": "2018-07-18-vue-component-table-form-management",
     "date": "2018-07-18",
