@@ -1,0 +1,112 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>.NET Core 微服务拆分实战：从单体到服务化 - HoEndo的技术博客</title>
+  <meta name="article-date" content="2019-04-08">
+  <meta name="article-tags" content=".NET Core,微服务,架构设计,服务拆分">
+  <meta name="description" content="将单体 .NET Core 应用拆分为微服务的实践：边界划分、通信设计和网关选型">
+</head>
+<body>
+  <article class="post-content">
+    <h1>.NET Core 微服务拆分实战：从单体到服务化</h1>
+
+    <h2>背景：一个膨胀的单体</h2>
+    <p>2018 年底接手这个项目时，它还是一个典型的 .NET Core 2.1 单体应用。用户模块、订单模块、商品模块、支付模块全塞在一个解决方案里，二十几个 Project，编译一次要三分钟。每次改订单逻辑，用户模块的单元测试也得跑一遍——不是逻辑上有耦合，是项目引用绑死了。</p>
+    <p>我记得最难受的一次是修一个支付回调的 bug，改了 PaymentService 里一行代码，CI 跑了四十分钟才绿。那四十分钟里我什么也做不了，因为测试全量跑，谁也不敢跳过。改完以后我跟团队说：再不拆，下次改 bug 我就先改简历。</p>
+
+    <h2>第一步：搞清楚边界在哪</h2>
+    <p>拆分不是把每个 Controller 拆成一个服务。我花了两周时间画上下文图，分析业务边界。最终定下来四个核心服务：</p>
+    <ul>
+      <li><strong>用户服务 (UserService)</strong>：注册、登录、权限、用户画像</li>
+      <li><strong>商品服务 (ProductService)</strong>：商品 CRUD、分类、库存查询</li>
+      <li><strong>订单服务 (OrderService)</strong>：创建订单、状态流转、退款</li>
+      <li><strong>支付服务 (PaymentService)</strong>：支付发起、回调处理、对账</li>
+    </ul>
+    <p>划分依据很简单：哪个模块改了最让人头疼，就先拆哪个。支付和订单是重灾区，优先拆。</p>
+    <p>边界划分有个坑：不要按数据库表来拆。一开始我想着「用户表归用户服务、订单表归订单服务」，结果发现订单服务每创建一笔订单都要查用户信息——如果走 API 调用，原来一个 JOIN 变成两次网络请求，延迟翻倍。后来改策略：允许适当的数据冗余，订单服务本地缓存一份用户昵称和头像 URL，用户信息变更时通过消息队列同步。</p>
+
+    <h2>第二步：通信怎么搞</h2>
+    <p>微服务之间通信，当时有三个选项摆在我面前：</p>
+    <p><strong>HTTP/REST</strong>：最直观，HttpClient 一把梭。问题是同步调用链一长，上游服务等下游，下游等数据库，请求堆积起来线程池直接打满。</p>
+    <p><strong>消息队列 (RabbitMQ)</strong>：异步解耦，削峰填谷。适合订单状态变更通知、库存扣减这种不需要同步返回结果的场景。</p>
+    <p><strong>gRPC</strong>：.NET Core 3.0 preview 里已经能用了，Protobuf 序列化，性能好。但生态还不够成熟，Ocelot 对 gRPC 转发支持也有限。</p>
+    <p>我最终选的方案是：<strong>同步走 HTTP，异步走 RabbitMQ</strong>。用户服务查商品详情这种高 QPS 的读操作走 HTTP，订单创建后通知库存扣减走消息队列。不算最优雅，但最稳。gRPC 打算等 .NET Core 3.1 正式发布后再切——后来也确实切了，那是另一篇文章。</p>
+    <p>消息队列落地时踩了个坑：消息格式到底用 JSON 还是 Protobuf？我一开始用 JSON，毕竟可读性好，调试方便。但跑了两个月发现 RabbitMQ 磁盘占用比预期高，消息体太大。切到 Protobuf 后消息体积缩了将近一半，但调试变麻烦了——看 RabbitMQ 管理界面里的消息体全是乱码。后来写了个小工具专门反序列化消息做调试，才算解决。</p>
+
+    <h2>第三步：网关选型——Ocelot</h2>
+    <p>服务拆开了，前端总得有个统一入口。2019 年初 .NET 生态的 API 网关选项不多：</p>
+    <ul>
+      <li><strong>Ocelot</strong>：.NET 原生，配置简单，社区活跃</li>
+      <li><strong>Kong</strong>：基于 Nginx/OpenResty，性能好但运维重</li>
+      <li><strong>自研</strong>：时间不够，放弃</li>
+    </ul>
+    <p>我选了 Ocelot 13.x，原因就一个：团队全是 .NET 技术栈，出了问题能自己改源码。用 Ocelot 配路由很简单，一个 JSON 文件搞定：</p>
+
+<pre><code class="language-json">{
+  "Routes": [
+    {
+      "DownstreamPathTemplate": "/api/users/{everything}",
+      "DownstreamScheme": "http",
+      "DownstreamHostAndPorts": [
+        { "Host": "user-service", "Port": 80 }
+      ],
+      "UpstreamPathTemplate": "/api/users/{everything}",
+      "UpstreamHttpMethod": [ "Get", "Post", "Put", "Delete" ]
+    }
+  ],
+  "GlobalConfiguration": {
+    "BaseUrl": "https://api.example.com"
+  }
+}</code></pre>
+
+    <p>但 Ocelot 不是银弹。它的限流功能基于内存，多实例部署时各算各的；认证授权需要自己写 Middleware 集成；而且配置文件一长，维护起来很痛苦。我后来把 ocelot.json 拆成多个文件，写了个脚本在 CI 里合并，勉强能维护。</p>
+    <p>另一个坑是 Ocelot 的请求聚合功能。文档上说可以合并多个下游请求，但实际用起来发现错误处理很简陋——一个下游挂了，聚合结果直接抛 500，不会优雅降级。我只好在聚合器外面又包了一层 try-catch 做 fallback。</p>
+
+    <h2>第四步：数据库怎么拆</h2>
+    <p>单体拆微服务最头疼的不是代码，是数据。原来一个 SQL Server 实例里几十张表，外键约束遍地都是。拆分策略分三步走：</p>
+    <p><strong>第一步：物理不拆，逻辑隔离。</strong>每个服务只访问自己的表，但数据库还是同一个实例。这阶段主要改代码，把跨表的 JOIN 拆成服务间 API 调用或本地缓存。风险最小，先跑通。</p>
+    <p><strong>第二步：独立数据库实例。</strong>跑稳了两个月，确认服务边界没问题了，开始把每个服务的表迁移到独立数据库。用户服务一个库，订单服务一个库。原来的分布式事务 (MSDTC) 全砍掉，改用 Saga 模式做最终一致性。</p>
+    <p><strong>第三步：读写分离。</strong>订单服务读多写少，给从库加了只读副本，查询全走从库。这一步在第二步之后做，因为从库同步延迟在可接受范围内。</p>
+    <p>Saga 模式我用的是编排式 (Orchestration)，不是 choreography。每个 Saga 有一个协调器，负责调用各服务的补偿接口。写起来代码多一点，但调试和追踪比事件驱动的方式直观太多。支付服务的退款流程就用 Saga，订单状态从「已支付」回退到「已退款」，库存也要加回去，整个流程可追踪。</p>
+
+    <h2>部署和监控</h2>
+    <p>服务拆完了，部署又是个新问题。之前单体一个 publish 包丢到 IIS 就完事，现在四个服务加一个网关，部署顺序还有依赖。我当时的方案是用脚本 + Docker Compose：</p>
+
+<pre><code class="language-yaml">version: '3.4'
+services:
+  gateway:
+    image: myapp/gateway:latest
+    ports:
+      - "80:80"
+    depends_on:
+      - user-service
+      - order-service
+  user-service:
+    image: myapp/user-service:latest
+    environment:
+      - ConnectionStrings__Default=Server=db;...
+  order-service:
+    image: myapp/order-service:latest
+    depends_on:
+      - rabbitmq</code></pre>
+
+    <p>这个阶段还没上 Kubernetes，Docker Compose 撑了半年。监控方面用了 App Metrics + InfluxDB + Grafana 那套，每个服务暴露 /metrics 端点，网关集中采集。告警配了 Prometheus AlertManager，数据库连接池用满、接口响应时间超过 2 秒都会触发钉钉通知。</p>
+    <p>日志统一用 Serilog + Elasticsearch，给每个请求生成一个 CorrelationId，网关生成后通过 Header 往下游传，排查问题的时候在 Kibana 里一个 ID 搜到底。这个习惯一直保持到现在，太实用了。</p>
+
+    <h2>踩过的坑</h2>
+    <p>说几个真金白银换来的教训：</p>
+    <p><strong>不要同时拆服务和拆数据库。</strong>我一开始想一步到位，结果上线那天订单创建全挂。排查了半天发现是数据库连接串没切干净，部分请求还连着旧库。第二次拆分时我严格遵循「先拆服务后拆库」的顺序，稳多了。</p>
+    <p><strong>健康检查要做对。</strong>一开始 Kestrel 的 health check 只返回 200，不管数据库通不通、Redis 连不连。有次 Redis 挂了，网关还在往这个实例转发请求，用户体验就是时而能访问时而不行——网关以为服务正常。后来加了数据库和 Redis 的健康检查探针，才算真正管用。</p>
+    <p><strong>服务发现的坑。</strong>Ocelot 本身不做服务发现，DownstreamHostAndPorts 是写死的。我一开始手动维护那个 JSON，有一次改 IP 忘了更新配置，网关请求全打到旧地址。后续引入了 Consul 做服务注册发现，Ocelot 配上 Consul Provider，才算自动化。</p>
+    <p><strong>不要过度拆分。</strong>拆了四个服务以后，我一度想把「商品搜索」也拆成独立服务，引入 Elasticsearch。后来冷静下来算了算：商品搜索每天才几百次调用，拆出去增加运维成本，不划算。微服务不是越细越好，按业务价值来。</p>
+
+    <h2>拆完之后回头看</h2>
+    <p>拆分花了将近三个月，中间出过三次线上事故。但拆完之后的效果是实打实的：订单模块改 bug 不需要跑全量测试，CI 从四十分钟降到八分钟。每个服务独立扩缩容，大促期间只给订单和支付服务加实例，不用整个单体都扩。</p>
+    <p>但也要诚实地说代价：运维复杂度上了一个台阶。日志分散了，链路追踪要引入 Jaeger；事务一致性从 ACID 变成 BASE，脑子要转过弯来；团队需要理解分布式系统的概念，学习曲线不低。</p>
+    <p>如果现在让我重新选一次，我会更早引入容器化，而不是先在虚拟机上用 Docker Compose 凑合。后来迁移到 Kubernetes 的时候又折腾了一遍，早知道一步到位。</p>
+  </article>
+  <script src="../assets/js/common.js"></script>
+</body>
+</html>

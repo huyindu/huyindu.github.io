@@ -1,6 +1,18 @@
 var POSTS_DATA = 
 [
   {
+    "title": ".NET Core 微服务拆分实战：从单体到服务化",
+    "slug": "2019-04-08-dotnet-core-microservice-split",
+    "date": "2019-04-08",
+    "tags": [
+      ".NET Core",
+      "微服务",
+      "架构设计",
+      "服务拆分"
+    ],
+    "summary": "将单体 .NET Core 应用拆分为微服务的实践：边界划分、通信设计和网关选型"
+  },
+  {
     "title": "ASP.NET Core 中间件管道详解",
     "slug": "2018-11-05-aspnetcore-middleware-pipeline",
     "date": "2018-11-05",
