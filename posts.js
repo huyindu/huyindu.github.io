@@ -1,6 +1,18 @@
 var POSTS_DATA = 
 [
   {
+    "title": "Docker 容器化 .NET Core 应用的完整流程",
+    "slug": "2019-08-20-docker-containerize-dotnet-core",
+    "date": "2019-08-20",
+    "tags": [
+      "Docker",
+      ".NET Core",
+      "容器化",
+      "DevOps"
+    ],
+    "summary": "从 Dockerfile 编写、多阶段构建到 docker-compose 编排，完整的 .NET Core 容器化实践"
+  },
+  {
     "title": ".NET Core 微服务拆分实战：从单体到服务化",
     "slug": "2019-04-08-dotnet-core-microservice-split",
     "date": "2019-04-08",

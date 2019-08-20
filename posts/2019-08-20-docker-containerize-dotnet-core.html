@@ -1,0 +1,207 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Docker 容器化 .NET Core 应用的完整流程 - HoEndo的技术博客</title>
+  <meta name="article-date" content="2019-08-20">
+  <meta name="article-tags" content="Docker,.NET Core,容器化,DevOps">
+  <meta name="description" content="从 Dockerfile 编写、多阶段构建到 docker-compose 编排，完整的 .NET Core 容器化实践">
+</head>
+<body>
+  <article class="post-content">
+    <h1>Docker 容器化 .NET Core 应用的完整流程</h1>
+
+    <h2>起点：为什么非要容器化</h2>
+    <p>2019 年夏天，我们的微服务已经在裸机 + IIS 上跑了半年。四个服务分别部署在四台 Windows Server 上，每次发版要远程桌面上去停 IIS、复制文件、重启站点。偶尔忘记复制某个 DLL，服务就起不来，排查半天发现是少了个依赖。</p>
+    <p>有一次凌晨两点发布，我在三台机器上操作，其中一台的 .NET Core Runtime 版本不对——测试环境装的是 2.2.6，生产那台不知道谁升级成了 2.2.7，一个 patch 版本差异导致某个 NuGet 包加载失败。从那之后我就决定把环境全部容器化，不再依赖宿主机的运行时。</p>
+
+    <h2>Dockerfile 从零开始</h2>
+    <p>第一个 Dockerfile 写得极其简陋：</p>
+
+<pre><code class="language-docker">FROM mcr.microsoft.com/dotnet/core/aspnet:2.2
+WORKDIR /app
+COPY ./publish/ ./
+ENTRYPOINT ["dotnet", "MyApp.dll"]</code></pre>
+
+    <p>能用，但镜像体积接近 1GB。每次 CI 构建完 push 到私有 Registry，几个服务加起来传了很久。后来学了多阶段构建，Dockerfile 进化成：</p>
+
+<pre><code class="language-docker">FROM mcr.microsoft.com/dotnet/core/sdk:2.2 AS build
+WORKDIR /src
+COPY *.sln ./
+COPY src/MyApp/MyApp.csproj src/MyApp/
+RUN dotnet restore
+COPY . ./
+RUN dotnet publish src/MyApp/MyApp.csproj -c Release -o /app
+
+FROM mcr.microsoft.com/dotnet/core/aspnet:2.2
+WORKDIR /app
+COPY --from=build /app ./
+ENTRYPOINT ["dotnet", "MyApp.dll"]</code></pre>
+
+    <p>多阶段构建的好处：build 阶段的 SDK 镜像不再进入最终镜像，体积直接砍到 260MB 左右。中间层利用 Docker 的缓存机制，CSProj 先 COPY 再 restore，只要依赖不变就不会重新 restore，构建速度大幅提升。</p>
+
+    <h2>Alpine 的坑——libc 缺失</h2>
+    <p>看到微软官方提供了 Alpine 版本的 Runtime 镜像，我心想这能省更多体积。把 aspnet:2.2 换成 aspnet:2.2-alpine，镜像缩到 150MB，高兴地部署上去。</p>
+    <p>结果服务启动就崩。查日志发现 System.DllNotFoundException，某个 Native 依赖找不到 glibc。Alpine 用的是 musl libc，而我们引用的一个 PDF 生成库 (WkHtmlToPdf) 底层依赖 glibc。</p>
+    <p>两小时排查无果，老老实实换回 Debian 基础镜像。教训：<strong>切 Alpine 之前先确认所有 Native 依赖都兼容 musl</strong>。后来在 Dockerfile 里加了健康检查，至少不会等上线才发现启动失败：</p>
+
+<pre><code class="language-docker">HEALTHCHECK --interval=30s --timeout=3s --retries=3 \
+  CMD curl -f http://localhost/health || exit 1</code></pre>
+
+    <h2>docker-compose 编排</h2>
+    <p>四个微服务加 RabbitMQ、Redis、SQL Server，单靠 docker run 一个一个起太痛苦。docker-compose 1.24 成了救命稻草：</p>
+
+<pre><code class="language-yaml">version: '3.7'
+services:
+  gateway:
+    build: ./src/Gateway
+    ports:
+      - "8080:80"
+    depends_on:
+      - user-service
+      - order-service
+    networks:
+      - backend
+
+  user-service:
+    build: ./src/UserService
+    environment:
+      - ConnectionStrings__Default=Server=sqlserver;Database=Users;User=sa;Password=${DB_PASSWORD}
+      - Redis__ConnectionString=redis:6379
+    depends_on:
+      - sqlserver
+      - redis
+    networks:
+      - backend
+
+  order-service:
+    build: ./src/OrderService
+    environment:
+      - ConnectionStrings__Default=Server=sqlserver;Database=Orders;User=sa;Password=${DB_PASSWORD}
+      - RabbitMQ__Host=rabbitmq
+    depends_on:
+      - sqlserver
+      - rabbitmq
+    networks:
+      - backend
+
+  sqlserver:
+    image: mcr.microsoft.com/mssql/server:2017-latest
+    environment:
+      - ACCEPT_EULA=Y
+      - SA_PASSWORD=${DB_PASSWORD}
+    volumes:
+      - sqldata:/var/opt/mssql
+    networks:
+      - backend
+
+  redis:
+    image: redis:5-alpine
+    networks:
+      - backend
+
+  rabbitmq:
+    image: rabbitmq:3-management-alpine
+    networks:
+      - backend
+
+networks:
+  backend:
+    driver: bridge
+
+volumes:
+  sqldata:</code></pre>
+
+    <p>这套编排在开发环境跑得很顺，docker-compose up 一把起。但坑在 depends_on 的理解上：depends_on 只等容器启动，不等服务就绪。SQL Server 容器启动后还要加载数据库文件，那几秒里 user-service 连不上数据库就挂了。解决方案是加 restart policy 和入口脚本轮询数据库：</p>
+
+<pre><code class="language-yaml">user-service:
+  restart: on-failure
+  entrypoint: ["/bin/sh", "-c", "until nc -z sqlserver 1433; do sleep 2; done; dotnet UserService.dll"]</code></pre>
+
+    <h2>.env 和环境变量管理</h2>
+    <p>数据库密码这种敏感信息一开始直接写在 docker-compose.yml 里，用 Git 管理。还好是私有仓库，但每次改密码都要改代码提交，很蠢。后来用 .env 文件分离：</p>
+
+<pre><code class="language-bash"># .env (不提交 Git)
+DB_PASSWORD=YourStrong!Passw0rd
+REDIS_PASSWORD=
+RABBITMQ_DEFAULT_USER=admin
+RABBITMQ_DEFAULT_PASS=admin123</code></pre>
+
+    <p>docker-compose 自动读取同目录的 .env 文件，变量用 ${VAR} 引用。生产环境的密码直接在服务器上维护 .env。</p>
+
+    <h2>构建加速：.dockerignore 和层缓存</h2>
+    <p>第一次 docker build 时没加 .dockerignore，把 obj、bin、node_modules 整个上下文都传给了 Docker Daemon，构建上下文 800MB 传了好几分钟。加了 .dockerignore：</p>
+
+<pre><code>**/bin
+**/obj
+**/node_modules
+.git
+*.md
+docker-compose*.yml
+Dockerfile
+.vs
+.vscode</code></pre>
+
+    <p>上下文直接缩到 50MB。另外 Dockerfile 里把 COPY . . 尽量往后放，前面的层变动少就能命中缓存。dotnet restore 依赖 csproj，只要不新增 NuGet 包这一步永远缓存。</p>
+
+    <h2>CI 集成</h2>
+    <p>容器化之前 CI 产出的就是一个 zip 包，运维手动部署。容器化之后 CI 流水线改成：</p>
+    <ol>
+      <li>Git pull，dotnet test</li>
+      <li>dotnet publish</li>
+      <li>docker build -t registry.example.com/myapp:${BUILD_NUMBER}</li>
+      <li>docker push</li>
+      <li>SSH 到服务器 docker-compose pull && docker-compose up -d</li>
+    </ol>
+    <p>这一步还是半自动的，部署要手动触发。后来上了 GitHub Actions 才全自动，那是 2020 年的事了。</p>
+
+    <h2>镜像版本策略</h2>
+    <p>一开始用 latest 标签，简单粗暴。很快尝到苦果：三台服务器同时 docker-compose pull，可能拉到不同版本。改成用 Git commit SHA 做标签：</p>
+
+<pre><code class="language-bash">TAG=$(git rev-parse --short HEAD)
+docker build -t registry.example.com/myapp:$TAG .
+docker push registry.example.com/myapp:$TAG</code></pre>
+
+    <p>docker-compose.yml 里用环境变量传入 TAG。回滚的时候直接改 TAG 值即可，几秒钟切回上一个版本。</p>
+
+    <h2>资源限制</h2>
+    <p>容器化后多个服务跑在同一台机器上，不限制资源会导致互相争抢。一次 RabbitMQ 消息积压，order-service 内存暴涨到 4GB，把同机的 user-service 挤 OOM 了。加了限制：</p>
+
+<pre><code class="language-yaml">order-service:
+  deploy:
+    resources:
+      limits:
+        cpus: '2'
+        memory: 2G
+      reservations:
+        cpus: '0.5'
+        memory: 512M</code></pre>
+
+    <p>soft limit 保证最小资源，hard limit 防止一个服务拖死一船人。</p>
+
+    <h2>日志收集</h2>
+    <p>容器化以后日志不再写到文件，全输出到 stdout/stderr。Docker 默认的 json-file driver 会把日志写满磁盘，尤其是 debug 级别的日志。改成了限制大小和轮转：</p>
+
+<pre><code class="language-yaml">order-service:
+  logging:
+    driver: "json-file"
+    options:
+      max-size: "10m"
+      max-file: "3"</code></pre>
+
+    <p>后面更进一步，把 Docker logging driver 切到 fluentd，日志直接进 Elasticsearch。但在 docker-compose 阶段没有引入额外的日志采集组件，这个问题留给了 Kubernetes 时代。</p>
+
+    <h2>本地开发体验</h2>
+    <p>容器化最大的意外收获是开发体验提升。新同事入职不需要装 Visual Studio 全家桶、配 SQL Server、装 Redis——docker-compose up 一把搞定所有依赖。甚至有人在 Mac 上开发也能跑 .NET Core，因为 Docker 里是 Linux 容器。</p>
+    <p>不过调试变麻烦了。原来 Visual Studio F5 直接 attach 进程，现在要远程调试容器：</p>
+
+<pre><code class="language-bash"># 开发用 Dockerfile，装 vsdbg
+docker build -f Dockerfile.debug -t myapp:debug .
+docker run -p 8080:80 -p 4024:4024 -e ASPNETCORE_ENVIRONMENT=Development myapp:debug</code></pre>
+
+    <p>vsdbg 是微软的远程调试工具，体验不如本地 F5，但至少能断点。更简单的方案是对着日志加 Console.WriteLine 然后 docker logs -f 看输出——虽原始但快。</p>
+  </article>
+  <script src="../assets/js/common.js"></script>
+</body>
+</html>
