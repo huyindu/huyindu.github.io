@@ -1,0 +1,225 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>小程序后台微服务化：从单体到 Kubernetes - HoEndo的技术博客</title>
+  <meta name="article-date" content="2019-12-10">
+  <meta name="article-tags" content=".NET Core,微服务,Kubernetes,微信小程序">
+  <meta name="description" content="微信小程序后台从单体架构演进到微服务，在 Kubernetes 上容器化部署的完整实践">
+</head>
+<body>
+  <article class="post-content">
+    <h1>小程序后台微服务化：从单体到 Kubernetes</h1>
+
+    <h2>单体末路的信号</h2>
+    <p>2019 年中，我们给一个电商小程序做后台。项目最初只有一个 ASP.NET Core 2.1 应用，管着用户登录（微信 code2session）、商品浏览、下单支付、物流跟踪、拼团活动、优惠券发放六块业务。代码在一个仓库里，三十几个 Controller，services 目录下塞了五十多个 Service 类。</p>
+    <p>真正让我下决心拆的是拼团功能上线那次。拼团逻辑改了 OrderService 里的一行状态判断，CI 跑了全量测试，500 多个用例跑了快一个小时。等着的时候我看了一眼代码规模：整个 solution 快 8 万行 C#，单次 dotnet build 耗时 90 秒。改一行，测全部——这种耦合已经不可接受了。</p>
+
+    <h2>拆分的路线图</h2>
+    <p>小程序后台的特点和普通 Web 后台不太一样。流量有明显的波峰——每天 10 点、15 点、20 点三个时段是推送通知后的访问高峰。拼团活动期间更夸张，某次秒杀活动 QPS 从平时 200 直接飙到 4000。</p>
+    <p>拆分的核心思路是：<strong>把高并发路径和低频路径隔离开</strong>。</p>
+    <p>最终划出六个服务：</p>
+    <table>
+      <tr><th>服务</th><th>职责</th><th>QPS</th></tr>
+      <tr><td>Gateway</td><td>统一入口、鉴权、限流</td><td>全量</td></tr>
+      <tr><td>UserService</td><td>微信登录、用户信息</td><td>中</td></tr>
+      <tr><td>ProductService</td><td>商品浏览、搜索</td><td>高</td></tr>
+      <tr><td>OrderService</td><td>下单、拼团、状态流转</td><td>高</td></tr>
+      <tr><td>CouponService</td><td>优惠券发放、核销</td><td>中</td></tr>
+      <tr><td>LogisticsService</td><td>物流查询、轨迹推送</td><td>低</td></tr>
+    </table>
+    <p>ProductService 和 OrderService 承受主要流量，可以独立扩缩容。CouponService 消费型的，用户领券是突发流量但不需要实时响应，走消息队列削峰。</p>
+
+    <h2>微信登录的拆分细节</h2>
+    <p>微信小程序的登录流程比较特殊，wx.login 拿到 code，后台用 code 换 openid 和 session_key。单体时期所有请求都要先走 UserController 做登录校验，拆开后每个服务都需要验证用户的登录态。</p>
+    <p>网关统一做认证是最自然的方案。在 Ocelot 里配一个认证中间件：</p>
+
+<pre><code class="language-csharp">public class WechatAuthMiddleware
+{
+    public async Task Invoke(HttpContext context)
+    {
+        var token = context.Request.Headers["Authorization"]
+            .FirstOrDefault()?.Replace("Bearer ", "");
+        if (string.IsNullOrEmpty(token))
+        {
+            context.Response.StatusCode = 401;
+            return;
+        }
+        var userInfo = await _cache.GetAsync<UserInfo>($"session:{token}");
+        if (userInfo == null)
+        {
+            context.Response.StatusCode = 401;
+            return;
+        }
+        context.Items["UserInfo"] = userInfo;
+    }
+}</code></pre>
+
+    <p>登录态存在 Redis 里，Token 是自定义的 GUID，有过期时间。网关验完后把 UserInfo 塞到 HttpContext.Items，下游服务通过 Header 拿到用户 ID。Ocelot 配置里加上 "AddHeadersToRequest" 就能把用户信息透传下去。</p>
+    <p>这里的坑是微信 session_key 有效期。用户长时间不打开小程序，session_key 过期了，但我们的 Redis 缓存还在。结果用户调用接口时网关判断已登录，到下游服务用 openid 查数据没问题，但调用微信接口（比如获取手机号）时发现 session_key 过期。后来加了两级过期：Redis 缓存 30 分钟，超时后重新用 refresh_token 换，微信那边没有 refresh 机制的话就直接让前端重新 login。</p>
+
+    <h2>迁移到 .NET Core 3.1 和 Kubernetes</h2>
+    <p>2019 年 12 月 3 号 .NET Core 3.1 正式发布，第一个真正的 LTS 版本。之前一直在 2.2 上跑，很多性能优化和 gRPC 支持都只在 3.x 有。趁着拆分的机会一把迁到 3.1。</p>
+    <p>迁移本身不复杂：TargetFramework 从 netcoreapp2.2 改成 netcoreapp3.1，几个过时的 API（比如 Newtonsoft.Json 换 System.Text.Json）顺手改了。但 Startup 类的变化比较坑人——3.0 以后不再默认兼容 2.x 的 MVC 服务注册方式，AddMvc 变成了 AddControllers。这个差异在编译期不报错，只有运行时才会发现路由没注册。</p>
+    <p>部署环境选 Kubernetes 1.17。原因很现实：六七个服务，手动管容器已经吃力，加上扩缩容、滚动更新、健康检查这些需求，Docker Compose 已经扛不住了。集群用的是云厂商的托管 K8s，Master 节点不用自己维护。</p>
+
+    <h2>K8s 部署的核心配置</h2>
+    <p>每个服务的 Deployment 结构类似，以 ProductService 为例：</p>
+
+<pre><code class="language-yaml">apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: product-service
+  labels:
+    app: product-service
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: product-service
+  template:
+    metadata:
+      labels:
+        app: product-service
+    spec:
+      containers:
+      - name: product-service
+        image: registry.example.com/product-service:1.2.0
+        ports:
+        - containerPort: 80
+        env:
+        - name: ConnectionStrings__Redis
+          valueFrom:
+            secretKeyRef:
+              name: redis-secret
+              key: connection
+        resources:
+          requests:
+            cpu: 500m
+            memory: 512Mi
+          limits:
+            cpu: 2000m
+            memory: 2Gi
+        livenessProbe:
+          httpGet:
+            path: /health/live
+            port: 80
+          initialDelaySeconds: 30
+          periodSeconds: 10
+        readinessProbe:
+          httpGet:
+            path: /health/ready
+            port: 80
+          initialDelaySeconds: 10
+          periodSeconds: 5</code></pre>
+
+    <p>livenessProbe 和 readinessProbe 一定要分开：liveness 只管进程是否存活，readiness 要检查数据库和 Redis 是否连通。容器启动后 readiness 失败的话 Service 不会把流量切过来，等数据库连接建立好再接收请求。</p>
+    <p>Service 定义：</p>
+
+<pre><code class="language-yaml">apiVersion: v1
+kind: Service
+metadata:
+  name: product-service
+spec:
+  selector:
+    app: product-service
+  ports:
+    - port: 80
+      targetPort: 80
+  type: ClusterIP</code></pre>
+
+    <p>Ingress 用的 Nginx Ingress Controller，把外部流量导到网关：</p>
+
+<pre><code class="language-yaml">apiVersion: networking.k8s.io/v1beta1
+kind: Ingress
+metadata:
+  name: api-gateway
+  annotations:
+    nginx.ingress.kubernetes.io/rewrite-target: /
+spec:
+  rules:
+  - host: api.example.com
+    http:
+      paths:
+      - path: /
+        backend:
+          serviceName: gateway
+          servicePort: 80</code></pre>
+
+    <h2>扩容：从 3 个副本到 10 个</h2>
+    <p>拼团秒杀当天，我们提前两小时把 ProductService 和 OrderService 的副本从 3 扩到 10：</p>
+
+<pre><code class="language-bash">kubectl scale deployment product-service --replicas=10
+kubectl scale deployment order-service --replicas=10</code></pre>
+
+    <p>同时把订单服务的数据库连接池上限从 200 调到 500，Redis 连接池从 50 调到 200。这几项配置在 appsettings.json 里，通过 ConfigMap 挂载：</p>
+
+<pre><code class="language-yaml">apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: order-service-config
+data:
+  appsettings.json: |
+    {
+      "Database": {
+        "MaxPoolSize": 500
+      },
+      "Redis": {
+        "PoolSize": 200
+      }
+    }</code></pre>
+
+    <p>秒杀过程中 OrderService 的 CPU 一度跑到 85%，但 response time 保持在 200ms 以内。K8s 的 HPA (Horizontal Pod Autoscaler) 还没来得及配生产环境，纯手动扩容，但至少比单体时代只能干瞪眼强太多了。</p>
+
+    <h2>消息队列和最终一致性</h2>
+    <p>小程序拼团场景有个典型问题：用户支付成功后，怎么通知拼团状态变更。支付回调在我们的支付网关 (微信支付通知地址) 触发，支付网关发给 RabbitMQ，拼团服务消费消息后更新拼团状态，再推送微信模板消息给参团用户。</p>
+    <p>这条链路涉及四个服务：支付网关 -> 消息队列 -> 拼团服务 -> 微信推送。每一跳都可能失败。可靠性靠两样东西保证：消息持久化 + 手动 ACK。</p>
+
+<pre><code class="language-csharp">var channel = connection.CreateModel();
+channel.QueueDeclare("group_buy_status", durable: true, exclusive: false);
+var consumer = new EventingBasicConsumer(channel);
+consumer.Received += async (model, ea) =>
+{
+    var body = ea.Body.ToArray();
+    var message = Encoding.UTF8.GetString(body);
+    try
+    {
+        await ProcessGroupBuyStatus(message);
+        channel.BasicAck(ea.DeliveryTag, false);
+    }
+    catch (Exception ex)
+    {
+        _logger.LogError(ex, "Failed to process group buy status");
+        channel.BasicNack(ea.DeliveryTag, false, true);
+    }
+};
+channel.BasicConsume("group_buy_status", false, consumer);</code></pre>
+
+    <p>durable queue + persistent messages + manual ack，保证消息不会丢。处理失败就 Nack 回队列重试，连续失败三次进死信队列人工处理。</p>
+
+    <h2>监控：Prometheus + Grafana</h2>
+    <p>上了 K8s 以后，Prometheus 是自然的选择。每个 .NET Core 服务引入 App.Metrics 或 prometheus-net 包，暴露 /metrics 端点。K8s 里配 ServiceMonitor：</p>
+
+<pre><code class="language-yaml">apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: dotnet-services
+spec:
+  selector:
+    matchLabels:
+      app: product-service
+  endpoints:
+  - port: metrics
+    interval: 15s</code></pre>
+
+    <p>Grafana 仪表盘主要盯四个指标：请求 QPS、P99 延迟、错误率、Pod CPU/内存。配了告警规则——错误率超过 1% 持续 5 分钟发钉钉通知，Pod 内存超过 limit 的 80% 也告警。</p>
+
+    <h2>回头看几个关键决策</h2>
+    <p>微服务架构改造不是技术炫技。我当时面临的最大阻力不是写代码，是说服团队接受「分布式系统必然会增加运维复杂度」这个现实。拆之前测试全跑一次性出结果，拆之后排查一个订单创建失败的 bug 可能要看三个服务的日志。引入了 Jaeger 做分布式追踪，才把排查效率拉回来。</p>
+    <p>另一个关键是数据库。最初六个服务共用一个 SQL Server，拆服务的意义打折。逐步迁移到独立数据库，到 2020 年初才算真正完成——支付服务的库、订单服务的库、用户服务的库，各自独立，中间用消息队列同步必要数据。</p>
+    <p>迁移到 .NET Core 3.1 和 K8s 的时间点刚好——3.1 是 LTS，K8s 1.17 稳定性也足够。如果早半年用 .NET Core 3.0（非 LTS），上线后还得再迁一次。</p>
+  </article>
+  <script src="../assets/js/common.js"></script>
+</body>
+</html>

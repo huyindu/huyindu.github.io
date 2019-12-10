@@ -1,6 +1,18 @@
 var POSTS_DATA = 
 [
   {
+    "title": "小程序后台微服务化：从单体到 Kubernetes",
+    "slug": "2019-12-10-miniapp-backend-microservice-k8s",
+    "date": "2019-12-10",
+    "tags": [
+      ".NET Core",
+      "微服务",
+      "Kubernetes",
+      "微信小程序"
+    ],
+    "summary": "微信小程序后台从单体架构演进到微服务，在 Kubernetes 上容器化部署的完整实践"
+  },
+  {
     "title": "Docker 容器化 .NET Core 应用的完整流程",
     "slug": "2019-08-20-docker-containerize-dotnet-core",
     "date": "2019-08-20",
