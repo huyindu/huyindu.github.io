@@ -1,0 +1,188 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>k3s + Rancher 轻量级 Kubernetes 部署指南 - HoEndo的技术博客</title>
+  <meta name="article-date" content="2020-03-15">
+  <meta name="article-tags" content="k3s,Rancher,Kubernetes,容器编排">
+  <meta name="description" content="使用 k3s 和 Rancher 搭建轻量级 Kubernetes 集群，部署 .NET Core 微服务的完整指南">
+</head>
+<body>
+  <article class="post-content">
+    <h1>k3s + Rancher 轻量级 Kubernetes 部署指南</h1>
+
+    <h2>选 k3s 的算账过程</h2>
+    <p>2020 年初，我手头有两个个人项目和一个小团队协作项目需要跑容器化部署。用云厂商托管 K8s 是最省心的方案——前面小程序那个项目就用的托管版——但算了一笔账：3 个节点的托管 K8s 集群每月大概 1500 块，一年一万八。这几个项目都是自掏腰包或者小预算，这个开销不太能接受。</p>
+    <p>自建标准 K8s (kubeadm) 是另一个选项。我看了一遍官方文档，Master 节点需要 etcd + kube-apiserver + kube-controller-manager + kube-scheduler，每个 Worker 节点需要 kubelet + kube-proxy + 容器运行时。最低配置建议 2 核 4G 起，再加上 etcd 的磁盘 IO 要求，一台 2 核 4G 的轻量云服务器勉强跑一个 Master，节点全是开销。</p>
+    <p>k3s 出来以后我试了一下，单节点部署占不到 512MB 内存，CPU 空闲时不到 5%。同样的 3 台 2 核 4G 机器，标准 K8s 跑完系统组件就剩不了多少资源给业务了，k3s 装完还有 3G 左右可用。这就是选它的全部理由——省资源。</p>
+
+    <h2>k3s 安装：一条命令的事</h2>
+    <p>k3s v1.17.4+k3s1 的安装简单到让人不习惯：</p>
+
+<pre><code class="language-bash"># Master 节点
+curl -sfL https://get.k3s.io | sh -
+
+# 查看节点状态
+sudo k3s kubectl get nodes
+
+# 获取 token 用于加入 Worker 节点
+sudo cat /var/lib/rancher/k3s/server/node-token</code></pre>
+
+    <p>Worker 节点加入：</p>
+
+<pre><code class="language-bash">curl -sfL https://get.k3s.io | K3S_URL=https://192.168.1.10:6443 \
+  K3S_TOKEN=K10c8f...::server:... sh -</code></pre>
+
+    <p>三台机器，十分钟搭完集群。对比之前看 kubeadm 文档时的心理阴影，k3s 的体验简直是降维打击。</p>
+    <p>一个小细节：k3s 默认用 containerd 而不是 Docker 做容器运行时，镜像管理命令不一样。习惯 docker 的可以用 --docker 参数切回 Docker：</p>
+
+<pre><code class="language-bash">curl -sfL https://get.k3s.io | sh -s - --docker</code></pre>
+
+    <p>但如果用 containerd，需要用 crictl 看容器、用 ctr 管镜像。几个常用命令：</p>
+
+<pre><code class="language-bash"># 列出镜像
+sudo crictl images
+
+# 查看运行中的 Pod
+sudo crictl pods
+
+# 导入镜像（ctr）
+sudo ctr image import myapp.tar</code></pre>
+
+    <p>我选择了 containerd，省掉了 Docker 那一层的开销。但后来在 CI 里构建镜像时发现 ctr 和 docker build 的镜像格式不完全兼容，偶尔需要 docker save 再 ctr import，多了个转换步骤。</p>
+
+    <h2>Rancher 2.4 的引入</h2>
+    <p>kubectl 命令行没问题，但团队里有人不习惯终端操作，而且多集群管理确实需要个面板。Rancher 2.4 是我用过的 K8s 管理工具里体验最好的一个。</p>
+    <p>安装 Rancher 本身用 Helm 3：</p>
+
+<pre><code class="language-bash">helm repo add rancher-stable https://releases.rancher.com/server-charts/stable
+kubectl create namespace cattle-system
+helm install rancher rancher-stable/rancher \
+  --namespace cattle-system \
+  --set hostname=rancher.example.com \
+  --set replicas=1</code></pre>
+
+    <p>访问 rancher.example.com 就能看到管理界面。Rancher 可以导入已有集群，也能从零创建新集群。我们的 k3s 集群是导入的，Rancher 不需要重新部署任何东西，只是在 cattle-system 命名空间里跑一个 agent 做代理。</p>
+    <p>Rancher 的监控集成很省心。点几下就自动部署了 Prometheus 和 Grafana，内置的集群监控仪表盘开箱即用——节点 CPU、内存、磁盘、Pod 状态一目了然。不用再自己摸索 Prometheus Operator 的安装和配置。</p>
+
+    <h2>.NET Core 微服务部署到 k3s</h2>
+    <p>业务部署和标准 K8s 完全一样，k3s 的 API 兼容 K8s。直接写 Deployment 和 Service YAML：</p>
+
+<pre><code class="language-yaml">apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: user-api
+  namespace: production
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: user-api
+  template:
+    metadata:
+      labels:
+        app: user-api
+    spec:
+      containers:
+      - name: user-api
+        image: registry.example.com/user-api:v1.0.3
+        ports:
+        - containerPort: 80
+        env:
+        - name: ASPNETCORE_ENVIRONMENT
+          value: Production
+        - name: ConnectionStrings__Default
+          valueFrom:
+            secretKeyRef:
+              name: db-secret
+              key: connection-string
+        resources:
+          requests:
+            memory: 128Mi
+            cpu: 100m
+          limits:
+            memory: 512Mi
+            cpu: 500m</code></pre>
+
+    <p>注意 resource requests 设得很小——128Mi 内存加 100m CPU，因为 k3s 节点本身资源有限。对于 .NET Core 应用，128Mi 是起得动的下限，生产环境建议 256Mi 起步。</p>
+
+    <h2>Traefik Ingress 的坑</h2>
+    <p>k3s 默认内置了 Traefik 作为 Ingress Controller，取代了标准 K8s 常用的 Nginx Ingress。Traefik 1.x (k3s 带的版本) 的配置语法和 Nginx Ingress 完全不同，一开始我没注意这个差异，直接套 Nginx Ingress 的 YAML，报了一堆错。</p>
+    <p>k3s 的 Traefik Ingress 写法：</p>
+
+<pre><code class="language-yaml">apiVersion: extensions/v1beta1
+kind: Ingress
+metadata:
+  name: api-ingress
+  annotations:
+    kubernetes.io/ingress.class: traefik
+spec:
+  rules:
+  - host: api.example.com
+    http:
+      paths:
+      - path: /
+        backend:
+          serviceName: user-api
+          servicePort: 80</code></pre>
+
+    <p>用了 kubernetes.io/ingress.class: traefik 这个 annotation 来指定 Ingress Controller。如果不加，k3s 默认也会用 Traefik 处理，但显式声明更安全。</p>
+    <p>HTTPS 证书管理，k3s 的 Traefik 默认不做自动签发。手动配 Let's Encrypt 需要在 Traefik 配置里加 ACME 相关设置，或者用 cert-manager：</p>
+
+<pre><code class="language-bash">kubectl apply -f https://github.com/jetstack/cert-manager/releases/download/v0.14.0/cert-manager.yaml</code></pre>
+
+    <p>然后创建 ClusterIssuer 和 Certificate 资源。cert-manager 自动申请和续期证书，配合 Ingress 的 tls 段使用。整个过程比手动配 Nginx + certbot 顺畅得多。</p>
+
+    <h2>私有镜像仓库的问题</h2>
+    <p>k3s 默认 containerd 的镜像拉取认证和 Docker 不一样。Docker 用 ~/.docker/config.json，containerd 需要在 registries.yaml 里配。k3s 可以通过 /etc/rancher/k3s/registries.yaml 统一配置：</p>
+
+<pre><code class="language-yaml">mirrors:
+  "registry.example.com":
+    endpoint:
+      - "https://registry.example.com"
+configs:
+  "registry.example.com":
+    auth:
+      username: ci-bot
+      password: ***</code></pre>
+
+    <p>改完重启 k3s 服务生效。如果每个 Namespace 里用 ImagePullSecret 的话就没这步的必要。我选择了 ImagePullSecret 方案，因为更灵活——每个 Namespace 可以用不同的仓库凭据：</p>
+
+<pre><code class="language-bash">kubectl create secret docker-registry regcred \
+  --docker-server=registry.example.com \
+  --docker-username=ci-bot \
+  --docker-password=*** \
+  -n production</code></pre>
+
+    <p>Deployment 里加上 imagePullSecrets 引用。</p>
+
+    <h2>资源紧张时的取舍</h2>
+    <p>3 台 2C4G 跑 6 个微服务，不算宽裕。有几个优化措施：</p>
+    <p>第一，Redis 和 PostgreSQL 不要部署在 k3s 里。数据库需要稳定的磁盘 IO，k3s 节点的本地磁盘不够可靠。在云上单独开最低配的托管 Redis (256MB 内存版，几十块一个月) 和 RDS，业务 Pod 通过内网连接。</p>
+    <p>第二，减少无用副本。非关键服务（比如日志统计、定时任务）跑单副本即可，省下的资源给到高并发服务。</p>
+    <p>第三，启用 k3s 的 --disable 参数关掉不需要的组件：</p>
+
+<pre><code class="language-bash">curl -sfL https://get.k3s.io | sh -s - \
+  --disable servicelb \
+  --disable local-storage</code></pre>
+
+    <p>ServiceLB 在我们的场景用不上（云厂商自带 LoadBalancer），local-storage 也不需要。关掉之后节省少量内存。</p>
+
+    <h2>升级和运维经验</h2>
+    <p>k3s 升级很简单，官方脚本加版本参数：</p>
+
+<pre><code class="language-bash">curl -sfL https://get.k3s.io | INSTALL_K3S_VERSION=v1.18.2+k3s1 sh -</code></pre>
+
+    <p>升级过程自动滚动更新，Master 先升，Worker 逐个来。中间有短暂的 API Server 不可用（几秒），但已运行的 Pod 不受影响。</p>
+    <p>监控是运维的底线。Rancher 自带的监控虽然好用，但我额外部署了 Loki + Promtail 做日志聚合。k3s 的 Pod 日志默认写在 /var/log/pods/ 下，Promtail 采集后送 Loki，Grafana 里查日志。比 kubectl logs 方便太多——不用记住 Pod 名字，直接搜关键词。</p>
+
+    <h2>k3s 稳定跑了半年后的感受</h2>
+    <p>从 2020 年 3 月搭起来到写这篇文章，k3s 跑了半年，中间只重启过两次——一次是升级版本，一次是云服务器底层维护。没遇到过 k3s 本身崩溃的情况。</p>
+    <p>最大的优势还是轻量。三台机器跑着十几个 Pod (业务 + 系统组件)，总内存占用不到 6GB（其中 2GB 是业务 Pod 用的）。如果同样跑标准 K8s，光 etcd 和 kube-system 组件就占了这些资源。</p>
+    <p>缺点也有：k3s 的版本比上游 K8s 慢一拍。K8s 1.18 出来一个多月后 k3s 才跟上。如果对 K8s 新特性有急切需求，这个延迟会有点难受。但一般场景完全够用。</p>
+    <p>另一个小毛病是 Traefik 1.x。k3s 内置的是 Traefik 1.7，社区早已不活跃，而 Traefik 2.x 的 CRD 配置更灵活但 k3s 不支持。想换 Nginx Ingress 的话需要手动部署并禁用内置 Traefik。我在一个项目里切换过，整体不难但需要重新配一遍路由规则。</p>
+  </article>
+  <script src="../assets/js/common.js"></script>
+</body>
+</html>

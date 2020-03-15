@@ -1,6 +1,18 @@
 var POSTS_DATA = 
 [
   {
+    "title": "k3s + Rancher 轻量级 Kubernetes 部署指南",
+    "slug": "2020-03-15-k3s-rancher-lightweight-k8s",
+    "date": "2020-03-15",
+    "tags": [
+      "k3s",
+      "Rancher",
+      "Kubernetes",
+      "容器编排"
+    ],
+    "summary": "使用 k3s 和 Rancher 搭建轻量级 Kubernetes 集群，部署 .NET Core 微服务的完整指南"
+  },
+  {
     "title": "小程序后台微服务化：从单体到 Kubernetes",
     "slug": "2019-12-10-miniapp-backend-microservice-k8s",
     "date": "2019-12-10",
