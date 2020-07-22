@@ -1,6 +1,18 @@
 var POSTS_DATA = 
 [
   {
+    "title": ".NET Core 微服务中的服务间通信：gRPC vs HTTP",
+    "slug": "2020-07-22-grpc-vs-http-microservice-dotnet",
+    "date": "2020-07-22",
+    "tags": [
+      ".NET Core",
+      "gRPC",
+      "微服务",
+      "性能对比"
+    ],
+    "summary": "在 .NET Core 微服务中对比 gRPC 和 HTTP/JSON 的性能差异，给选型建议"
+  },
+  {
     "title": "k3s + Rancher 轻量级 Kubernetes 部署指南",
     "slug": "2020-03-15-k3s-rancher-lightweight-k8s",
     "date": "2020-03-15",

@@ -1,0 +1,189 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>.NET Core 微服务中的服务间通信：gRPC vs HTTP - HoEndo的技术博客</title>
+  <meta name="article-date" content="2020-07-22">
+  <meta name="article-tags" content=".NET Core,gRPC,微服务,性能对比">
+  <meta name="description" content="在 .NET Core 微服务中对比 gRPC 和 HTTP/JSON 的性能差异，给选型建议">
+</head>
+<body>
+  <article class="post-content">
+    <h1>.NET Core 微服务中的服务间通信：gRPC vs HTTP</h1>
+
+    <h2>问题触发：HTTP 扛不住了</h2>
+    <p>我们的订单服务内部有一个高频调用场景：创建订单时需要调用商品服务验证 SKU 库存和价格。用户下单高峰时段，这个调用 QPS 在 2000 左右。高峰期商品服务的 HTTP 接口 P99 延迟从平日的 15ms 飙升到 180ms，订单服务因为同步等待，整体响应时间也被拖上去。</p>
+    <p>看了监控，瓶颈不在数据库查询——商品服务的 SQL 查询只有 3ms——瓶颈在 JSON 序列化/反序列化上。一个 SKU 信息 JSON 大概 800 字节，序列化 + 反序列化两端加起来要占 12ms 左右。2000 QPS 下，单是 JSON 处理就消耗了大量 CPU。</p>
+    <p>那时 gRPC-dotnet 2.30 已经比较成熟，.NET Core 3.1 内置了 gRPC 服务模板，Protobuf 3.12 是当前稳定版。我决定做个对比测试。</p>
+
+    <h2>对比环境搭建</h2>
+    <p>测试服务：一个简单的商品查询接口，输入 SKU ID 列表（1 到 10 个），返回 SKU 的价格、库存、名称。两个版本：</p>
+    <p>HTTP 版本用 ASP.NET Core Controller：</p>
+
+<pre><code class="language-csharp">[ApiController]
+[Route("api/[controller]")]
+public class ProductsController : ControllerBase
+{
+    [HttpPost("batch")]
+    public async Task&lt;ActionResult&lt;List&lt;ProductDto&gt;&gt;&gt; GetBatch(
+        [FromBody] List&lt;string&gt; skuIds)
+    {
+        var products = await _repo.GetByIdsAsync(skuIds);
+        return Ok(products.Select(p =&gt; new ProductDto
+        {
+            SkuId = p.SkuId,
+            Name = p.Name,
+            Price = p.Price,
+            Stock = p.Stock
+        }).ToList());
+    }
+}</code></pre>
+
+    <p>gRPC 版本定义 Proto 文件：</p>
+
+<pre><code class="language-protobuf">syntax = "proto3";
+
+service ProductService {
+  rpc GetBatch (GetBatchRequest) returns (GetBatchResponse);
+}
+
+message GetBatchRequest {
+  repeated string sku_ids = 1;
+}
+
+message GetBatchResponse {
+  repeated Product products = 1;
+}
+
+message Product {
+  string sku_id = 1;
+  string name = 2;
+  double price = 3;
+  int32 stock = 4;
+}</code></pre>
+
+    <p>gRPC 服务实现：</p>
+
+<pre><code class="language-csharp">public class ProductServiceImpl : ProductService.ProductServiceBase
+{
+    public override async Task&lt;GetBatchResponse&gt; GetBatch(
+        GetBatchRequest request, ServerCallContext context)
+    {
+        var ids = request.SkuIds.ToList();
+        var products = await _repo.GetByIdsAsync(ids);
+        var response = new GetBatchResponse();
+        response.Products.AddRange(products.Select(p =&gt; new Product
+        {
+            SkuId = p.SkuId,
+            Name = p.Name,
+            Price = (double)p.Price,
+            Stock = p.Stock
+        }));
+        return response;
+    }
+}</code></pre>
+
+    <h2>测试数据和压测工具</h2>
+    <p>测试环境：两台 4C8G 云主机，一台跑服务端，一台跑客户端。服务端一个实例（单 Pod），数据库查询走内存缓存（排除 DB 影响）。</p>
+    <p>压测工具选了两个：Bombardier（HTTP 压测）和 ghz（gRPC 压测），并发连接数从 50 逐步加到 500，每次加压持续 60 秒。</p>
+    <p>测试四组场景：</p>
+    <table>
+      <tr><th>场景</th><th>说明</th><th>数据量</th></tr>
+      <tr><td>小请求-1个SKU</td><td>查单个商品</td><td>响应 ~200B</td></tr>
+      <tr><td>中请求-5个SKU</td><td>查5个商品</td><td>响应 ~900B</td></tr>
+      <tr><td>大请求-10个SKU</td><td>查10个商品</td><td>响应 ~1800B</td></tr>
+      <tr><td>流式-20个SKU</td><td>用 gRPC server streaming</td><td>20条记录</td></tr>
+    </table>
+
+    <h2>性能对比结果</h2>
+    <p>500 并发连接下，查单个 SKU 的对比：</p>
+    <table>
+      <tr><th>指标</th><th>HTTP/JSON</th><th>gRPC</th><th>差异</th></tr>
+      <tr><td>QPS</td><td>8,200</td><td>18,500</td><td>gRPC 高 126%</td></tr>
+      <tr><td>P50 延迟</td><td>32ms</td><td>15ms</td><td>gRPC 低 53%</td></tr>
+      <tr><td>P99 延迟</td><td>145ms</td><td>42ms</td><td>gRPC 低 71%</td></tr>
+      <tr><td>CPU (服务端)</td><td>68%</td><td>35%</td><td>gRPC 低 48%</td></tr>
+      <tr><td>网络流量</td><td>12MB/s</td><td>5.8MB/s</td><td>gRPC 低 52%</td></tr>
+    </table>
+
+    <p>查 10 个 SKU 的数据差异更明显：</p>
+    <table>
+      <tr><th>指标</th><th>HTTP/JSON</th><th>gRPC</th></tr>
+      <tr><td>QPS</td><td>3,100</td><td>9,200</td></tr>
+      <tr><td>P99 延迟</td><td>380ms</td><td>78ms</td></tr>
+      <tr><td>网络流量</td><td>45MB/s</td><td>11MB/s</td></tr>
+    </table>
+
+    <p>序列化开销是差异的主要来源。JSON 序列化在 System.Text.Json 下已经比 Newtonsoft.Json 快不少，但和 Protobuf 比还是差了一个数量级。Protobuf 的二进制编码不需要序列化属性名（字段用数字编号替代），数值直接存二进制而非字符串，体积天然小。</p>
+
+    <h2>HTTP/2 多路复用的红利</h2>
+    <p>gRPC 基于 HTTP/2，支持单连接多路复用。500 并发下的 HTTP/1.1 方案需要维护 500 个 TCP 连接，而 gRPC 只需要少量连接。服务端的 socket 句柄和 TCP 状态开销差异巨大。测试中 HTTP/1.1 在 500 并发时出现了连接超时和端口耗尽的问题（临时端口范围限制），gRPC 完全没这个问题。</p>
+
+    <h2>切 gRPC 的工程细节</h2>
+    <p>测试数据出来后，我们把订单服务到商品服务的调用从 HTTP 切成了 gRPC。切换过程比预期顺利，但有几个工程细节要注意：</p>
+    <p><strong>Proto 文件的管理。</strong>几个微服务共用 Proto 定义，必须统一管理。我们在一个单独的 Git 仓库里放所有 Proto 文件，CI 构建时生成对应语言的代码，打包成私有 NuGet 包。服务端和客户端都引用同一个 NuGet 包，保证接口定义一致：</p>
+
+<pre><code class="language-xml">&lt;ItemGroup&gt;
+  &lt;PackageReference Include="Grpc.AspNetCore" Version="2.30.0" /&gt;
+  &lt;PackageReference Include="Company.Protos.Product" Version="1.2.0" /&gt;
+&lt;/ItemGroup&gt;</code></pre>
+
+    <p><strong>超时和重试。</strong>HTTP 调用的超时可以设 HttpClient.Timeout，gRPC 需要在调用时传 deadline：</p>
+
+<pre><code class="language-csharp">var response = await _productClient.GetBatchAsync(request,
+    deadline: DateTime.UtcNow.AddMilliseconds(500));</code></pre>
+
+    <p>不设 deadline 的话 gRPC 调用永远不超时，下游挂了调用方会一直挂着。我在生产上遗漏了这步，有一次商品服务因为数据库慢查询卡住，订单服务的 gRPC 调用全挂起，线程池耗尽。加上 deadline 之后配合重试策略才稳。</p>
+    <p>重试用 Polly：</p>
+
+<pre><code class="language-csharp">var retryPolicy = Policy
+    .Handle&lt;RpcException&gt;(ex =&gt; ex.StatusCode == StatusCode.Unavailable)
+    .WaitAndRetryAsync(3, retryAttempt =&gt;
+        TimeSpan.FromMilliseconds(100 * Math.Pow(2, retryAttempt)));
+
+var products = await retryPolicy.ExecuteAsync(async () =&gt;
+    await _productClient.GetBatchAsync(request, deadline: ...));</code></pre>
+
+    <p><strong>负载均衡。</strong>gRPC 连接是长连接，标准的 K8s Service (ClusterIP) 做负载均衡只在连接建立时有效——一旦建立，后续请求全走同一条连接到同一个 Pod。需要用 Headless Service + 客户端负载均衡，或者用 Service Mesh 的 sidecar 代理（比如 Linkerd）来实现真正的连接级负载均衡。我选择了在客户端用 DNS 轮询 + Subchannel 的方式：</p>
+
+<pre><code class="language-csharp">services.AddGrpcClient&lt;ProductService.ProductServiceClient&gt;(o =&gt;
+{
+    o.Address = new Uri("dns://product-service-headless");
+}).ConfigureChannel(o =&gt;
+{
+    o.Credentials = ChannelCredentials.Insecure;
+    o.ServiceConfig = new ServiceConfig
+    {
+        LoadBalancingConfigs = { new RoundRobinConfig() }
+    };
+});</code></pre>
+
+    <p><strong>网关的坑。</strong>如果 API 网关还需要对外暴露 gRPC 接口（比如给移动端用），Ocelot 对 gRPC-Web 的支持有限。我当时的做法是：外部流量继续走 HTTP/JSON 通过网关，内部服务间通信走 gRPC 直连。网关对内网 gRPC 调用做转换——这个模式叫 gRPC 网关 (gRPC-Gateway)，但 .NET 生态当时没有现成的方案，我在网关层写了一层转换代码，把外部的 HTTP 请求转成 gRPC 调用。不算优雅，但能跑。</p>
+
+    <h2>序列化性能深入对比</h2>
+    <p>单独做了序列化 benchmark，用 BenchmarkDotNet 对比三种方案的序列化 + 反序列化耗时（10 个 SKU 对象）：</p>
+    <table>
+      <tr><th>方案</th><th>序列化</th><th>反序列化</th><th>总耗时</th><th>消息大小</th></tr>
+      <tr><td>Newtonsoft.Json</td><td>8.2μs</td><td>12.5μs</td><td>20.7μs</td><td>1850B</td></tr>
+      <tr><td>System.Text.Json</td><td>3.8μs</td><td>5.1μs</td><td>8.9μs</td><td>1780B</td></tr>
+      <tr><td>Protobuf</td><td>0.9μs</td><td>1.2μs</td><td>2.1μs</td><td>520B</td></tr>
+    </table>
+
+    <p>Protobuf 序列化速度快 4-9 倍，体积小 70%。在 10000 QPS 的场景下，这个差异直接决定了 CPU 使用率。</p>
+
+    <h2>什么时候不该用 gRPC</h2>
+    <p>gRPC 不是万能药。有几个场景我不推荐：</p>
+    <p><strong>浏览器直连。</strong>浏览器不支持 HTTP/2 Trailers，需要 gRPC-Web 做中间代理。多一层代理就多一层复杂度。对外暴露的 API，特别是要给第三方调用的，HTTP/JSON 更实在。</p>
+    <p><strong>调试和排查。</strong>gRPC 请求/响应是二进制，curl 没法直接测试。调试工具链（grpcurl、BloomRPC）不如 Postman 普及。我常用的调试方式是用 grpcurl：</p>
+
+<pre><code class="language-bash">grpcurl -plaintext -d '{"sku_ids": ["SKU001","SKU002"]}' \
+  product-service:50051 ProductService/GetBatch</code></pre>
+
+    <p>比 curl 多了几个参数，新同事上手慢一些。</p>
+    <p><strong>小规模服务。</strong>如果整个系统就三四个微服务，QPS 也不高，HTTP/JSON 完全够用。引入 Protobuf 的代码生成步骤、Proto 文件管理、NuGet 包版本控制，这些工程开销在小团队里不划算。</p>
+    <p>切 gRPC 后我们的订单服务延迟下降了 60%，商品服务 CPU 从 65% 降到 25%。效果实打实，但这是建立在内部服务高 QPS 通信的前提上。</p>
+  </article>
+  <script src="../assets/js/common.js"></script>
+</body>
+</html>
