@@ -1,6 +1,18 @@
 var POSTS_DATA = 
 [
   {
+    "title": "CI/CD 流水线实战：GitHub Actions + Docker + k3s",
+    "slug": "2020-10-28-github-actions-docker-k3s-cicd",
+    "date": "2020-10-28",
+    "tags": [
+      "CI/CD",
+      "GitHub Actions",
+      "Docker",
+      "k3s"
+    ],
+    "summary": "使用 GitHub Actions 构建 .NET Core 应用的 CI/CD 流水线，自动测试、构建镜像并部署到 k3s"
+  },
+  {
     "title": ".NET Core 微服务中的服务间通信：gRPC vs HTTP",
     "slug": "2020-07-22-grpc-vs-http-microservice-dotnet",
     "date": "2020-07-22",

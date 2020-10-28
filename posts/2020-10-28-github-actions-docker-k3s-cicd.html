@@ -1,0 +1,171 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>CI/CD 流水线实战：GitHub Actions + Docker + k3s - HoEndo的技术博客</title>
+  <meta name="article-date" content="2020-10-28">
+  <meta name="article-tags" content="CI/CD,GitHub Actions,Docker,k3s">
+  <meta name="description" content="使用 GitHub Actions 构建 .NET Core 应用的 CI/CD 流水线，自动测试、构建镜像并部署到 k3s">
+</head>
+<body>
+  <article class="post-content">
+    <h1>CI/CD 流水线实战：GitHub Actions + Docker + k3s</h1>
+
+    <h2>从 scp 到 push 即部署</h2>
+    <p>我踩过坑。项目早期部署方式是：本地 <code>dotnet publish</code>，压缩成 tar.gz，scp 到服务器，ssh 上去解压，<code>systemctl restart</code>。每次发布五六分钟，中间还容易漏步骤。有一次凌晨两点修 bug，迷迷糊糊少重启了一个服务，第二天被客户电话打爆。</p>
+    <p>2020 年回头看，GitHub Actions 已经从 2019 年 11 月 GA 到现在积累了近一年的生态，<code>actions/setup-dotnet</code> 已经非常成熟。k3s v1.18 作为轻量 Kubernetes 发行版在边缘和小集群场景下表现稳定。是时候把这条手工流水线彻底自动化了。</p>
+
+    <h2>流水线设计</h2>
+    <p>目标很清楚：推代码到 GitHub → 自动跑测试 → 构建 Docker 镜像 → 推送到私有仓库 → 部署到 k3s 集群。</p>
+    <p>整个流程拆成两个 Workflow 文件。第一个负责 CI：checkout、restore、build、test、docker build & push。第二个负责 CD：kubectl 更新 deployment 并等待 rollout 完成。</p>
+
+    <h2>触发条件</h2>
+    <p>CI 在 PR 和 push 到 main 分支时触发，CD 只在 push 到 main 时触发。用 workflow_run 事件可以让 CD 等 CI 跑完再执行，但实践中我发现直接用 push 触发 CD 并加上 <code>paths</code> 过滤更简单——毕竟 CI 不过的话镜像也不会 push。</p>
+
+    <h2>CI Workflow：构建与测试</h2>
+    <pre><code class="language-yaml">name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v2
+      - uses: actions/setup-dotnet@v1
+        with:
+          dotnet-version: '3.1.x'
+      - run: dotnet restore
+      - run: dotnet build --no-restore -c Release
+      - run: dotnet test --no-build -c Release --verbosity normal</code></pre>
+    <p><code>dotnet test</code> 那一步花了我不少时间调。项目里有些集成测试依赖 PostgreSQL，在 CI 里跑不起来。我的做法是把集成测试单独放到一个 test project，用 <code>[Trait("Category", "Integration")]</code> 标记，然后 CI 里跑 <code>dotnet test --filter Category!=Integration</code>。</p>
+
+    <h2>Docker 镜像构建</h2>
+    <p>接在 test 后面，同一个 job 里加 docker 步骤：</p>
+    <pre><code class="language-yaml">      - run: dotnet publish -c Release -o out
+      - uses: docker/setup-buildx-action@v1
+      - uses: docker/login-action@v1
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GHCR_TOKEN }}
+      - uses: docker/build-push-action@v2
+        with:
+          context: .
+          push: true
+          tags: ghcr.io/huyindu/myapp:${{ github.sha }}</code></pre>
+    <p>Dockerfile 这里有个容易被忽略的细节：用 multi-stage build，sdk 镜像做 restore/build/publish，runtime 镜像只复制发布产物。.NET Core 3.1 的 runtime 镜像大概 200 MB，比 sdk 的 700 MB 小很多。</p>
+    <pre><code class="language-dockerfile">FROM mcr.microsoft.com/dotnet/sdk:3.1 AS build
+WORKDIR /src
+COPY *.csproj .
+RUN dotnet restore
+COPY . .
+RUN dotnet publish -c Release -o /app
+
+FROM mcr.microsoft.com/dotnet/aspnet:3.1
+WORKDIR /app
+COPY --from=build /app .
+ENTRYPOINT ["dotnet", "MyApp.dll"]</code></pre>
+
+    <h2>CD Workflow：部署到 k3s</h2>
+    <p>CD 部分的核心是用 <code>kubectl</code> 更新镜像。k3s 默认的 kubeconfig 在 <code>/etc/rancher/k3s/k3s.yaml</code>，把内容 base64 编码后存到 GitHub Secrets 里。</p>
+    <pre><code class="language-yaml">name: CD
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v2
+      - run: |
+          mkdir -p ~/.kube
+          echo "${{ secrets.KUBECONFIG }}" | base64 -d > ~/.kube/config
+      - run: |
+          kubectl set image deployment/myapp \
+            myapp=ghcr.io/huyindu/myapp:${{ github.sha }} \
+            --record
+      - run: kubectl rollout status deployment/myapp --timeout=120s</code></pre>
+    <p>这里的 <code>--record</code> 参数很重要，kubectl 会把变更原因记到 deployment 的 annotation 里，出问题时 <code>kubectl rollout history</code> 一眼能看出来是哪次提交引入的。</p>
+
+    <h2>k3s 集群准备工作</h2>
+    <p>k3s 安装本身一行命令：<code>curl -sfL https://get.k3s.io | sh -</code>。装完之后需要做几件事：</p>
+    <p>第一，创建命名空间和 deployment。GitHub Actions 的 runner 通过 kubectl 连过来，所以需要先把集群内的资源定义好。</p>
+    <pre><code class="language-yaml">apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: myapp
+  namespace: prod
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: myapp
+  template:
+    metadata:
+      labels:
+        app: myapp
+    spec:
+      containers:
+      - name: myapp
+        image: ghcr.io/huyindu/myapp:latest
+        ports:
+        - containerPort: 80
+        env:
+        - name: ConnectionStrings__Default
+          valueFrom:
+            secretKeyRef:
+              name: db-secret
+              key: connection-string</code></pre>
+    <p>敏感信息走 Kubernetes Secret，不要写死在 yaml 里。创建 Secret：<code>kubectl create secret generic db-secret --from-literal=connection-string='...' -n prod</code>。</p>
+    <p>第二，镜像拉取凭证。ghcr.io 是私有仓库，k3s 需要凭据才能拉镜像。创建一个 docker-registry 类型的 Secret 并 patch 到 service account：</p>
+    <pre><code class="language-bash">kubectl create secret docker-registry ghcr-secret \
+  --docker-server=ghcr.io \
+  --docker-username=huyindu \
+  --docker-password=$GHCR_TOKEN \
+  -n prod
+
+kubectl patch serviceaccount default \
+  -p '{"imagePullSecrets": [{"name": "ghcr-secret"}]}' \
+  -n prod</code></pre>
+    <p>第三，Traefik Ingress。k3s 自带 Traefik，直接创建 Ingress 资源就能暴露服务：</p>
+    <pre><code class="language-yaml">apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: myapp
+  namespace: prod
+spec:
+  rules:
+  - host: api.huyindu.dev
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: myapp
+            port:
+              number: 80</code></pre>
+
+    <h2>坑与经验</h2>
+    <p>整套流程跑通之后碰到的第一个坑是 GitHub Actions 的 secret 不能直接用在 fork 的 PR 上。PR 来自 fork 时 <code>secrets.GHCR_TOKEN</code> 是空的，docker login 会失败。解决办法是在 workflow 里加条件判断，PR 时跳过 docker push 步骤。</p>
+    <p>第二个坑是 k3s 内置的 containerd 有时候拉镜像会超时。k3s 默认的 <code>registry.yaml</code> 可以配置 mirror，我加了阿里云的镜像加速之后问题解决。</p>
+    <p>第三个坑说出来有点蠢：kubeconfig 里的 server 地址写的是 <code>https://127.0.0.1:6443</code>，GitHub Actions runner 当然连不上。改成公网 IP 或者用 Tailscale/Cloudflare Tunnel 之类的方案做安全暴露。</p>
+
+    <h2>效果</h2>
+    <p>从 push 代码到新版本上线，平均耗时 4 分钟（CI 两分半，CD 一分半）。对比之前手动 scp 的五分钟流程，时间上似乎没省太多，但省掉的是人的注意力——push 完就可以切到下一个任务，不用盯着终端等发布完成。</p>
+    <p>我用过一段时间后最大的感受不是效率提升，而是犯错机会的消失。凌晨修 bug 不会再漏重启服务，不会忘记跑测试，不会把旧版本的 dll 传到服务器上。自动化消除的不是工作量，是不确定性。</p>
+
+    <h2>后续演进</h2>
+    <p>这套流水线后来加了两个东西：一是 Helm chart，把裸 yaml 换成模板化的部署描述；二是环境分离，staging 环境用 PR 自动部署，prod 环境走手动 approve。不过那就是另一个故事了。</p>
+  </article>
+  <script src="../assets/js/common.js"></script>
+</body>
+</html>
