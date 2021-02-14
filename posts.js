@@ -1,6 +1,18 @@
 var POSTS_DATA = 
 [
   {
+    "title": "RabbitMQ 在 .NET 微服务中的可靠消息实践",
+    "slug": "2021-02-14-rabbitmq-reliable-messaging-dotnet",
+    "date": "2021-02-14",
+    "tags": [
+      "RabbitMQ",
+      ".NET Core",
+      "消息队列",
+      "微服务"
+    ],
+    "summary": "实现消息确认、死信队列和幂等消费，确保 .NET 微服务中消息的可靠投递"
+  },
+  {
     "title": "CI/CD 流水线实战：GitHub Actions + Docker + k3s",
     "slug": "2020-10-28-github-actions-docker-k3s-cicd",
     "date": "2020-10-28",

@@ -1,0 +1,231 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>RabbitMQ 在 .NET 微服务中的可靠消息实践 - HoEndo的技术博客</title>
+  <meta name="article-date" content="2021-02-14">
+  <meta name="article-tags" content="RabbitMQ,.NET Core,消息队列,微服务">
+  <meta name="description" content="实现消息确认、死信队列和幂等消费，确保 .NET 微服务中消息的可靠投递">
+</head>
+<body>
+  <article class="post-content">
+    <h1>RabbitMQ 在 .NET 微服务中的可靠消息实践</h1>
+
+<h2>问题现场</h2>
+
+<p>凌晨两点收到报警：订单状态同步延迟，部分订单在"已支付"和"已发货"之间反复横跳。翻日志发现同一个订单的状态变更消息被消费了三次，每次处理结果还不一样——第一次成功更新为"已发货"，第二次又改回了"已支付"，第三次再改回"已发货"。用户看到的界面就是状态闪来闪去。</p>
+
+<p>排查下来两个问题：消费者没有正确发送 ACK，broker 认为消息没处理完就重新投递；另外消费者拿到消息后直接写库，没有任何幂等判断。</p>
+
+<p>我用的是 RabbitMQ 3.8，客户端库 RabbitMQ.Client 6.2，服务跑在 .NET 5 上。这个系统有三条核心异步链路：订单创建 → 库存扣减、支付回调 → 订单状态更新、订单完成 → 积分发放。每条链路都依赖消息可靠投递。</p>
+
+<h2>消息确认机制</h2>
+
+<p>RabbitMQ 的消息确认分两个层面：生产者到 Broker 的 Publisher Confirm，以及 Broker 到消费者的 Consumer Ack。</p>
+
+<p>Publisher Confirm 的开关在连接工厂配置：</p>
+
+<pre><code class="language-csharp">var factory = new ConnectionFactory
+{
+    HostName = "rabbitmq.internal",
+    PublisherConfirms = true
+};
+</code></pre>
+
+<p>有了 Publisher Confirm，消息到底有没有到达 Broker 就不再靠猜。我封装了一个发布方法，用 TaskCompletionSource 把异步确认转成可等待的操作：</p>
+
+<pre><code class="language-csharp">public async Task&lt;bool&gt; PublishWithConfirmAsync(
+    IModel channel, string exchange, string routingKey, byte[] body)
+{
+    channel.ConfirmSelect();
+    var tcs = new TaskCompletionSource&lt;bool&gt;();
+
+    channel.BasicAcks += (sender, args) =&gt;
+    {
+        if (args.DeliveryTag == sequenceNumber)
+            tcs.TrySetResult(true);
+    };
+    channel.BasicNacks += (sender, args) =&gt;
+    {
+        if (args.DeliveryTag == sequenceNumber)
+            tcs.TrySetResult(false);
+    };
+
+    var sequenceNumber = channel.NextPublishSeqNo;
+    channel.BasicPublish(exchange, routingKey, null, body);
+
+    return await tcs.Task;
+}
+</code></pre>
+
+<p>消费者侧的 ACK 策略有两种：自动 ACK 和手动 ACK。自动 ACK 就是 Broker 把消息发给消费者后立即标记为已确认——消息可能还没处理完消费者就挂了，这条消息就丢了。生产环境必须用手动 ACK。</p>
+
+<pre><code class="language-csharp">var consumer = new EventingBasicConsumer(channel);
+consumer.Received += (sender, args) =&gt;
+{
+    try
+    {
+        ProcessMessage(args.Body);
+        channel.BasicAck(args.DeliveryTag, multiple: false);
+    }
+    catch (Exception ex)
+    {
+        _logger.LogError(ex, "消息处理失败");
+        channel.BasicNack(args.DeliveryTag, multiple: false, requeue: true);
+    }
+};
+
+channel.BasicConsume(queue: "order.status",
+                     autoAck: false,
+                     consumer: consumer);
+</code></pre>
+
+<p>注意 BasicNack 的 requeue 参数。设为 true 消息重新入队，马上又被投递，如果失败原因是业务逻辑Bug而不是瞬时故障，就会死循环。我踩过这个坑——库存接口挂了，消息不断 requeue 把 RabbitMQ 内存打满。后来改成 requeue: false，失败的消息进入死信队列，人工排查后再重新投递。</p>
+
+<h2>死信队列</h2>
+
+<p>死信队列（Dead Letter Queue, DLQ）是消息可靠性的最后一道防线。消息变成死信有三种情况：被消费者 Reject/Nack 且 requeue=false、消息 TTL 过期、队列长度超限。</p>
+
+<p>声明队列时绑定死信交换机：</p>
+
+<pre><code class="language-csharp">var args = new Dictionary&lt;string, object&gt;
+{
+    { "x-dead-letter-exchange", "dlx.order" },
+    { "x-dead-letter-routing-key", "dlx.order.status" },
+    { "x-message-ttl", 86400000 } // 24小时
+};
+
+channel.ExchangeDeclare("dlx.order", ExchangeType.Direct, durable: true);
+channel.QueueDeclare("dlq.order.status", durable: true, exclusive: false, autoDelete: false);
+channel.QueueBind("dlq.order.status", "dlx.order", "dlx.order.status");
+
+channel.QueueDeclare("order.status", durable: true, exclusive: false, autoDelete: false, arguments: args);
+</code></pre>
+
+<p>死信消息也不能烂在队列里。我写了一个死信处理 Job，定时扫描 DLQ，把消息体序列化后存到数据库的 dead_messages 表，记录失败次数、原始队列、异常堆栈。运维人员通过管理后台查看死信，手动修复数据后点"重新投递"按钮，后台把消息原样发回原始队列。</p>
+
+<h2>幂等消费</h2>
+
+<p>回到开头那个订单状态反复横跳的问题。根本原因是消费者没有幂等保证。即使 ACK 机制正确，网络抖动导致 Broker 没收到 ACK、消息还是会被重复投递。所以消费者必须能安全处理重复消息。</p>
+
+<p>我加了一个去重表：</p>
+
+<pre><code class="language-sql">CREATE TABLE idempotency_keys (
+    message_id VARCHAR(128) PRIMARY KEY,
+    consumer_group VARCHAR(64),
+    created_at TIMESTAMP DEFAULT NOW()
+);
+
+CREATE INDEX idx_idempotency_created
+    ON idempotency_keys(created_at)
+    WHERE created_at &lt; NOW() - INTERVAL '7 days';
+</code></pre>
+
+<p>每条消息生成一个全局唯一的 messageId（生产者侧用 GUID 或业务主键组合），消费者拿到消息后：</p>
+
+<pre><code class="language-csharp">public async Task HandleAsync(OrderStatusMessage message)
+{
+    // 尝试插入去重键，主键冲突说明已处理过
+    var inserted = await _db.TryInsertIdempotencyKeyAsync(message.MessageId, "order-status-consumer");
+    if (!inserted)
+    {
+        _logger.LogWarning("重复消息，跳过: {MessageId}", message.MessageId);
+        return;
+    }
+
+    await _orderService.UpdateStatusAsync(message.OrderId, message.NewStatus);
+}
+</code></pre>
+
+<p>TryInsertIdempotencyKey 用原生 SQL 的 INSERT ... ON CONFLICT DO NOTHING（PostgreSQL），返回值判断是否真的插入了行。这个操作和后续业务更新放在同一个数据库事务里，要么都成功要么都回滚，保证去重操作和业务操作原子化。</p>
+
+<p>去重键有 TTL。我建了部分索引只保留 7 天内的记录，每天凌晨跑一个清理 Job 删掉过期的键。</p>
+
+<pre><code class="language-sql">DELETE FROM idempotency_keys WHERE created_at &lt; NOW() - INTERVAL '7 days';</code></pre>
+
+<h2>消息持久化与高可用</h2>
+
+<p>RabbitMQ 默认把消息存在内存里，重启就没了。生产环境必须开持久化：</p>
+
+<pre><code class="language-csharp">var properties = channel.CreateBasicProperties();
+properties.Persistent = true; // 消息持久化到磁盘
+
+channel.QueueDeclare("order.status", durable: true, ...);
+</code></pre>
+
+<p>加上镜像队列（RabbitMQ 3.8 还是用镜像队列，3.9 才出 Quorum Queue），消息被复制到集群中多个节点。一台机器挂了，其他节点还有副本。</p>
+
+<p>我用过的策略是 ha-mode=exactly, ha-params=2，每条消息在集群里保持两个副本——原节点加一个镜像。这样在可靠性和性能之间取了个平衡。三副本磁盘 IO 翻三倍，小集群扛不住。</p>
+
+<h2>监控</h2>
+
+<p>可靠消息不是配完就完事，要持续监控。我加了四个指标：</p>
+
+<p>Publisher Confirm 失败率：超过 1% 告警，可能是 Broker 磁盘满了或者网络问题。</p>
+
+<p>队列积压深度：超过阈值说明消费者跟不上生产速度。我们设置的阈值是 10000 条——正常处理能力 5000 条/秒，积压 10000 意味着已有 2 秒延迟，还在可控范围但需要关注。</p>
+
+<p>死信队列增长速率：正常情况下 DLQ 应该接近空。突然涨起来说明有批量消息处理失败。</p>
+
+<p>ACK 超时数量：消费者处理单条消息超过 30 秒就记录一条 warn 日志。如果大面积超时，考虑拆队列或者提高消费并发。</p>
+
+<p>RabbitMQ 自带管理插件暴露 HTTP API，Prometheus 有现成的 exporter 可以抓 metrics 推给 Grafana。我们用的就是这套：rabbitmq_prometheus → Prometheus → Grafana 面板，队列深度、消息速率、连接数一目了然。</p>
+
+<h2>Prefetch 的坑</h2>
+
+<p>RabbitMQ 默认会尽可能多地把消息推给消费者，不管消费者能不能消化。这在吞吐量和公平调度之间有个 tradeoff。用 BasicQos 限制每次推送的消息数：</p>
+
+<pre><code class="language-csharp">channel.BasicQos(prefetchSize: 0, prefetchCount: 50, global: false);
+</code></pre>
+
+<p>prefetchCount 设多少合适？我试过 1，公平性最好——慢消费者不会占着消息不放，但吞吐量掉了一半。设成 200，吞吐量上来了，但有一个消费者正好在处理大批耗时消息，其他消息都在它那儿排队，其他消费者却闲着。</p>
+
+<p>最后定在 50，单条消息平均处理 50ms，50 条预取刚好填满处理窗口又不至于造成严重的不均衡。这个值要根据实际消息大小和处理耗时调，没有银弹。</p>
+
+<h2>连接与信道管理</h2>
+
+<p>RabbitMQ.Client 里 Connection 是 TCP 长连接，IModel（Channel）是连接上的逻辑信道。一条 Connection 可以开多个 Channel，但 Channel 不是线程安全的——多个线程共享一个 Channel 可能导致帧交错。</p>
+
+<p>我的做法：每个消费者线程独占一个 Channel，生产者用 Channel 池。Channel 池在启动时预热 20 个 Channel，借出归还，避免频繁创建销毁。</p>
+
+<pre><code class="language-csharp">public class ChannelPool : IDisposable
+{
+    private readonly ConcurrentBag&lt;IModel&gt; _channels = new();
+    private readonly IConnection _connection;
+
+    public IModel Rent()
+    {
+        if (_channels.TryTake(out var channel))
+            return channel;
+
+        return _connection.CreateModel();
+    }
+
+    public void Return(IModel channel)
+    {
+        if (channel.IsOpen)
+            _channels.Add(channel);
+    }
+}
+</code></pre>
+
+<p>Connection 断开时 Channel 全废，池里的 Channel 都要重建。我注册了 ConnectionShutdown 事件，触发时清空池子，等重连后重新预热。</p>
+
+<p>我推荐用 Polly 做重连策略：</p>
+
+<pre><code class="language-csharp">Policy
+    .Handle&lt;BrokerUnreachableException&gt;()
+    .WaitAndRetryForever(
+        retryAttempt =&gt; TimeSpan.FromSeconds(Math.Min(30, Math.Pow(2, retryAttempt))),
+        onRetry: (ex, time) =&gt;
+            _logger.LogWarning("RabbitMQ 连接失败，{Time} 后重试", time));
+</code></pre>
+
+<p>指数退避，最长 30 秒，不会因为频繁重连把 Broker 打得更惨。</p>
+
+<p>从发现重复消费到最后彻底解决，前后折腾了三天。核心教训：消息队列的三个保障——确认、死信、幂等——缺一个就可能在某个异常路径上丢数据或重复数据。排查时不要在应用日志里大海捞针，直接开 RabbitMQ Management 看队列的 ack/unacked/ready 三个计数器，基本就能定位问题出在生产端还是消费端。</p>
+  </article>
+  <script src="../assets/js/common.js"></script>
+</body>
+</html>
