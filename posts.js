@@ -1,6 +1,18 @@
 var POSTS_DATA = 
 [
   {
+    "title": "Redis 分布式锁在 .NET 微服务中的实现",
+    "slug": "2021-06-08-redis-distributed-lock-dotnet",
+    "date": "2021-06-08",
+    "tags": [
+      "Redis",
+      "分布式锁",
+      ".NET Core",
+      "微服务"
+    ],
+    "summary": "基于 StackExchange.Redis 实现 RedLock 分布式锁，解决微服务下的并发资源竞争"
+  },
+  {
     "title": "RabbitMQ 在 .NET 微服务中的可靠消息实践",
     "slug": "2021-02-14-rabbitmq-reliable-messaging-dotnet",
     "date": "2021-02-14",

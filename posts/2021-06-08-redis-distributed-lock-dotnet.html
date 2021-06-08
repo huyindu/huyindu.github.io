@@ -1,0 +1,228 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Redis 分布式锁在 .NET 微服务中的实现 - HoEndo的技术博客</title>
+  <meta name="article-date" content="2021-06-08">
+  <meta name="article-tags" content="Redis,分布式锁,.NET Core,微服务">
+  <meta name="description" content="基于 StackExchange.Redis 实现 RedLock 分布式锁，解决微服务下的并发资源竞争">
+</head>
+<body>
+  <article class="post-content">
+    <h1>Redis 分布式锁在 .NET 微服务中的实现</h1>
+
+<h2>问题：定时任务重复执行</h2>
+
+<p>结算系统每天凌晨 2 点跑一次商户账单结算，逻辑是汇总前一天的所有订单，计算分账金额，打款到商户账户。原本只有一个服务实例，一切正常。上个月为了高可用扩成 3 个 Pod，从第二个月开始就出事了——部分商户收到了两笔甚至三笔打款。</p>
+
+<p>原因很简单：3 个 Pod 各自跑了一遍同一个结算任务，因为没有互斥机制。这就是分布式环境下典型的资源竞争问题：多个进程、同一个业务操作、需要互斥。</p>
+
+<p>我用的技术栈是 .NET 5 + StackExchange.Redis 2.2 + Redis 6.2 集群。选 Redis 做分布式锁的原因很简单：已有的基础设施，不需要引入 ZooKeeper 或 etcd，开发和运维成本最低。</p>
+
+<h2>单节点锁的起步</h2>
+
+<p>最基础的 Redis 锁用 SET NX EX：</p>
+
+<pre><code class="language-csharp">public async Task&lt;bool&gt; AcquireLockAsync(string key, string value, TimeSpan expiry)
+{
+    return await _database.StringSetAsync(
+        key, value, expiry, When.NotExists);
+}
+</code></pre>
+
+<p>SET 带 NX（Not Exists）保证原子性——只有 Key 不存在时才设置成功，等于抢锁。value 放一个唯一标识（GUID 或机器名+线程ID），解锁时验证 value，防止删了别人的锁。</p>
+
+<pre><code class="language-csharp">public async Task ReleaseLockAsync(string key, string value)
+{
+    // Lua 脚本保证比较和删除原子化
+    const string script = @"
+        if redis.call('GET', KEYS[1]) == ARGV[1] then
+            return redis.call('DEL', KEYS[1])
+        else
+            return 0
+        end";
+
+    await _database.ScriptEvaluateAsync(script, new RedisKey[] { key }, new RedisValue[] { value });
+}
+</code></pre>
+
+<p>用 Lua 而不是先 GET 再 DEL，因为两个操作之间可能被插队——A 线程 GET 拿到自己的 value，在 DEL 之前锁过期了，B 线程抢到了锁，然后 A 线程执行 DEL 把 B 线程的锁删了。Lua 脚本在 Redis 里原子执行，不存在这个问题。</p>
+
+<h2>锁续期——WatchDog 模式</h2>
+
+<p>锁有过期时间。业务逻辑执行时间不确定：正常可能 5 秒，偶尔碰到大批量数据要 30 秒。过期时间设短了业务没跑完锁就释放了，设长了持有锁的 Pod 挂了其他 Pod 要等半天。</p>
+
+<p>解决方法：加一个后台续期任务，定期给锁续命。Redisson（Java 客户端）里叫 WatchDog，我照着它的思路实现了一个：</p>
+
+<pre><code class="language-csharp">public async Task&lt;DistributedLock&gt; AcquireWithAutoRenewalAsync(
+    string key, TimeSpan expiry, CancellationToken ct = default)
+{
+    var value = Guid.NewGuid().ToString("N");
+    var acquired = await _database.StringSetAsync(key, value, expiry, When.NotExists);
+    if (!acquired) return null;
+
+    // 启动续期循环
+    var renewalCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+    var renewalTask = RenewLockAsync(key, value, expiry, renewalCts.Token);
+
+    return new DistributedLock(key, value, renewalCts, renewalTask);
+}
+
+private async Task RenewLockAsync(string key, string value, TimeSpan expiry, CancellationToken ct)
+{
+    while (!ct.IsCancellationRequested)
+    {
+        await Task.Delay(expiry / 3, ct); // 每 1/3 过期时间续一次
+
+        const string script = @"
+            if redis.call('GET', KEYS[1]) == ARGV[1] then
+                return redis.call('PEXPIRE', KEYS[1], ARGV[2])
+            else
+                return 0
+            end";
+
+        var result = await _database.ScriptEvaluateAsync(
+            script,
+            new RedisKey[] { key },
+            new RedisValue[] { value, (long)expiry.TotalMilliseconds });
+
+        if ((int)result == 0) break; // 锁已经被别人拿了，停止续期
+    }
+}
+
+public class DistributedLock : IAsyncDisposable
+{
+    private readonly CancellationTokenSource _cts;
+    private readonly Task _renewalTask;
+    private readonly string _key;
+    private readonly string _value;
+    private readonly IDatabase _db;
+
+    public async ValueTask DisposeAsync()
+    {
+        _cts.Cancel();
+        try { await _renewalTask; } catch (TaskCanceledException) { }
+
+        const string script = @"..."; // 同上
+        await _db.ScriptEvaluateAsync(script,
+            new RedisKey[] { _key }, new RedisValue[] { _value });
+    }
+}
+</code></pre>
+
+<p>使用侧加上 using 就能自动管理锁的生命周期：</p>
+
+<pre><code class="language-csharp">await using (var @lock = await _lockManager.AcquireWithAutoRenewalAsync(
+    "settlement:daily:lock", TimeSpan.FromSeconds(30)))
+{
+    if (@lock == null)
+    {
+        _logger.LogInformation("已有实例在执行结算，跳过");
+        return;
+    }
+
+    await ExecuteSettlementAsync();
+} // DisposeAsync 释放锁，停止续期
+</code></pre>
+
+<h2>Redis 集群下的 RedLock</h2>
+
+<p>上面的实现在单节点 Redis 上没问题，但在生产环境的 Redis Cluster 或 Sentinel 架构下有一个经典竞态：</p>
+
+<p>客户端 A 在 Master 上获取了锁，Master 还没来得及同步到 Slave 就宕机了。Slave 升为新的 Master，没有 A 的锁记录。客户端 B 在新 Master 上获取同一个锁——成功。A 和 B 同时认为自己持有锁。</p>
+
+<p>Redis 作者 antirez 提出的 RedLock 算法试图解决这个问题：在 N 个独立的 Redis 实例上分别获取锁，当且仅当在超过半数（N/2+1）的实例上获取成功，才算获得分布式锁。</p>
+
+<p>我实现了一个简化版，对内网延迟（&lt;1ms）场景足够：</p>
+
+<pre><code class="language-csharp">public async Task&lt;RedLock&gt; AcquireRedLockAsync(
+    string resource, TimeSpan ttl, int retryCount = 2, int retryDelayMs = 100)
+{
+    var value = CreateLockValue();
+    // 假设 _databases 是 N 个独立 Redis 实例的连接
+    var instances = _databases.Length;
+    var quorum = instances / 2 + 1;
+
+    for (int attempt = 0; attempt &lt;= retryCount; attempt++)
+    {
+        var startTime = Stopwatch.GetTimestamp();
+        var acquired = 0;
+
+        // 并行请求所有实例
+        var tasks = _databases.Select(async db =&gt;
+        {
+            var ok = await db.StringSetAsync(resource, value, ttl, When.NotExists);
+            if (ok) Interlocked.Increment(ref acquired);
+        });
+        await Task.WhenAll(tasks);
+
+        var elapsed = Stopwatch.GetElapsedTime(startTime);
+        var drift = TimeSpan.FromMilliseconds(elapsed.TotalMilliseconds * 0.01);
+        var validityTime = ttl - elapsed - drift;
+
+        if (acquired &gt;= quorum &amp;&amp; validityTime &gt; TimeSpan.Zero)
+        {
+            return new RedLock(resource, value, validityTime, _databases);
+        }
+
+        // 获取失败，释放已获取的锁
+        await ReleaseLockOnAllInstances(resource, value);
+
+        if (attempt &lt; retryCount)
+            await Task.Delay(Random.Shared.Next(retryDelayMs));
+    }
+
+    return null;
+}
+</code></pre>
+
+<p>几个关键点：</p>
+
+<p>时钟漂移处理。RedLock 论文提到不同机器的时钟偏差可能导致锁提前过期。我在计算 validityTime 时扣掉了 1% 的漂移余量。内网 NTP 同步良好的情况下，1% 足够保守。</p>
+
+<p>重试时随机延迟。多个客户端同时竞争同一把锁，同时失败同时重试会造成活锁。随机延迟把它们的重试时间打散。</p>
+
+<p>释放锁要释放全部实例，包括那些获取失败的——因为可能 SET 命令已经到达 Redis 但响应包丢了，客户端以为失败但实际成功了。</p>
+
+<p>RedLock 在社区有争议。Martin Kleppmann 认为基于时间的锁不可靠，antirez 写了长文反驳。我在实践中用了两年没出过问题，前提是 Redis 实例真正独立——不能是同一台物理机上的多个进程，也不能共享同一个持久化存储。</p>
+
+<h2>锁粒度与性能</h2>
+
+<p>最开始我把结算锁的 key 设成 settlement:daily:lock，全局一把锁。所有商户共用，一个商户的结算阻塞了其他所有商户。月结时账单多的商户要跑 10 分钟，其他商户全部排队——完全没必要。</p>
+
+<p>改成按商户粒度：settlement:{merchantId}:daily:lock。每个商户独立竞争，互不影响。对应的代码只需要把 key 从常量改成拼接：</p>
+
+<pre><code class="language-csharp">var lockKey = $"settlement:{merchantId}:daily:{date:yyyyMMdd}";
+</code></pre>
+
+<p>锁粒度也有度。最极端是每条订单记录加一把锁——锁开销比业务逻辑还大，本末倒置。我的一般原则：锁的竞争者越多、持锁时间越长，粒度越要细。如果持锁时间在毫秒级，全局一把锁通常够了。</p>
+
+<h2>可重入锁</h2>
+
+<p>我碰到过一个场景：方法 A 获取了锁，内部调用了方法 B，B 也需要同一把锁。基础的互斥锁导致死锁。</p>
+
+<p>可重入锁的实现不复杂：value 里除了唯一标识，存一个计数器。加锁时发现 value 相等就只加计数器不阻塞：</p>
+
+<pre><code class="language-csharp">const string reentrantScript = @"
+    if redis.call('GET', KEYS[1]) == ARGV[1] then
+        redis.call('INCR', KEYS[1] .. ':cnt')
+        return 1
+    else
+        return redis.call('SET', KEYS[1], ARGV[1], 'NX', 'PX', ARGV[2])
+    end";
+</code></pre>
+
+<p>不过我在结算场景里设计上避免了重入——业务方法职责单一，不该嵌套加锁。可重入很多时候是设计问题的遮羞布，不是第一选择。</p>
+
+<h2>总结踩坑</h2>
+
+<p>分布式锁看起来简单，SET NX EX 几行代码，但生产环境各种边界条件：锁过期、主从切换、时钟漂移、网络分区、GC 停顿。</p>
+
+<p>GC 停顿是个容易被忽视的问题。.NET 的 Gen 2 GC 可能停几百毫秒，如果恰好发生在持锁期间，锁可能在 GC 恢复前就过期了。RedLock 的 validityTime 里扣掉 drift 能覆盖正常 GC 抖动，但如果 GC 停顿超过 TTL，什么算法都救不了——这个时候需要调整 GC 模式（Server GC、减少分配）而不是怪锁实现。</p>
+
+<p>最后说一句：分布式锁解决的是并发互斥，不解决幂等问题。即使拿到锁，业务逻辑依然要考虑重复执行的可能性。锁只是降低重复概率，不是消除。这两个在系统设计里是不同层次的问题。</p>
+  </article>
+  <script src="../assets/js/common.js"></script>
+</body>
+</html>
