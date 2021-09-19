@@ -1,6 +1,18 @@
 var POSTS_DATA = 
 [
   {
+    "title": "微服务下的分布式配置中心设计",
+    "slug": "2021-09-19-distributed-config-center-microservice",
+    "date": "2021-09-19",
+    "tags": [
+      "配置中心",
+      "Apollo",
+      "Consul",
+      ".NET Core"
+    ],
+    "summary": "对比 Apollo 和 Consul 在 .NET 微服务中的配置管理方案，实现配置热更新"
+  },
+  {
     "title": "Redis 分布式锁在 .NET 微服务中的实现",
     "slug": "2021-06-08-redis-distributed-lock-dotnet",
     "date": "2021-06-08",

@@ -1,0 +1,164 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>微服务下的分布式配置中心设计 - HoEndo的技术博客</title>
+  <meta name="article-date" content="2021-09-19">
+  <meta name="article-tags" content="配置中心,Apollo,Consul,.NET Core">
+  <meta name="description" content="对比 Apollo 和 Consul 在 .NET 微服务中的配置管理方案，实现配置热更新">
+</head>
+<body>
+  <article class="post-content">
+    <h1>微服务下的分布式配置中心设计</h1>
+
+<h2>一个配置引发的全量部署</h2>
+
+<p>去年某天下午，运营同事在群里说短信模板有个错别字要改。短信模板存在配置里——appsettings.json 的 Sms.Template。就改一个字，要走一整套部署流程：改文件 → 提交 PR → 合并到 develop → 构建镜像 → 滚动更新 30 个微服务 Pod。整套下来最快 40 分钟。</p>
+
+<p>改一个配置要重新部署所有服务，实在太痛苦了。配置中心是微服务的基础设施标配——没有它，配置变更要么忍受全量部署，要么走上手工改各个节点配置文件的邪路，迟早出事故。</p>
+
+<p>我们的服务在 .NET 5 上，技术选型时对比了阿波罗（Apollo）和 Consul。最终选了 Apollo 做主力配置中心，Consul 同时承担服务发现和部分 KV 配置。</p>
+
+<h2>Apollo 的架构模型</h2>
+
+<p>Apollo 是携程开源的项目，国内最流行的配置中心。它的核心抽象是 AppId + Namespace。</p>
+
+<p>AppId 标识一个应用。Namespace 是配置的命名空间，分私有（private）和公共（public）。公共 Namespace 可以被多个应用共享——比如数据库连接串、Redis 地址这些基础设施配置，维护一份就够了。私有 Namespace 只对当前应用可见。</p>
+
+<p>Apollo 的分环境机制靠 Cluster 实现。一个 AppId 下可以有多个 Cluster，默认 default 对应生产环境，可以额外创建 DEV、FAT、UAT 等。这个设计比在配置文件名里加环境后缀优雅得多。</p>
+
+<p>发布流程：Portal 上修改配置 → 点击发布 → Config Service 通知客户端 → 客户端拉取最新配置到内存。客户端还定期轮询做兜底，防止推送通知丢失。</p>
+
+<p>.NET 侧的接入用 Com.Ctrip.Framework.Apollo 包：</p>
+
+<pre><code class="language-csharp">// Program.cs
+public static IHostBuilder CreateHostBuilder(string[] args) =&gt;
+    Host.CreateDefaultBuilder(args)
+        .ConfigureAppConfiguration((context, builder) =&gt;
+        {
+            builder.AddApollo(builder.Build().GetSection("apollo"))
+                   .AddDefault()
+                   .AddNamespace("application")
+                   .AddNamespace("microservices.common"); // 公共配置
+        })
+        .ConfigureWebHostDefaults(web =&gt; web.UseStartup&lt;Startup&gt;());
+</code></pre>
+
+<p>appsettings.json 里放 Apollo 的连接参数：</p>
+
+<pre><code class="language-json">{
+  "apollo": {
+    "AppId": "order-service",
+    "MetaServer": "http://apollo-config:8080",
+    "Env": "DEV",
+    "Cluster": "default"
+  }
+}
+</code></pre>
+
+<p>Apollo 覆盖了 .NET 的 IConfiguration，配置项直接注入：</p>
+
+<pre><code class="language-csharp">public class SmsService
+{
+    public SmsService(IConfiguration config)
+    {
+        var template = config["Sms:Template"]; // 自动获取最新值
+    }
+}
+</code></pre>
+
+<p>但如果 SmsService 是单例，构造函数只在启动时执行一次，后面的配置变更不会反映到 template 字段里。热更新需要配合 IOptionsSnapshot：</p>
+
+<pre><code class="language-csharp">public class SmsService
+{
+    private readonly IOptionsSnapshot&lt;SmsOptions&gt; _options;
+
+    public async Task SendAsync(string phone, string code)
+    {
+        var template = _options.Value.Template; // 每次请求取最新配置
+    }
+}
+</code></pre>
+
+<p>IT OptionsSnapshot 是 scoped 的，每个请求重新解析，所以能拿到最新值。IT OptionsMonitor 是 singleton，需要注册回调，适用长期持有的对象。</p>
+
+<h2>Consul 的另一种路线</h2>
+
+<p>Consul 本质是服务发现工具，但它的 KV Store 和 Watch 机制天然适合做配置中心。我们团队用 Consul 管理那些需要和基础设施动态联动的配置——比如限流阈值、熔断参数。</p>
+
+<p>.NET 接入 Consul 配置用 Winton.Extensions.Configuration.Consul：</p>
+
+<pre><code class="language-csharp">builder.AddConsul(
+    "order-service/appsettings",
+    options =&gt;
+    {
+        options.ConsulConfigurationOptions = c =&gt;
+            c.Address = new Uri("http://consul:8500");
+        options.Optional = false;
+        options.ReloadOnChange = true;
+        options.PollWaitTime = TimeSpan.FromSeconds(5);
+    });
+</code></pre>
+
+<p>Consul 的热更新依赖长轮询（Long Polling）。客户端发 GET 请求带 index 参数，服务端如果配置没变就阻塞到超时再返回，有变更立即返回。ReloadOnChange 设为 true，.NET 的 IConfiguration 会在 Consul 配置变更时自动触发 reload token。</p>
+
+<h2>Apollo vs Consul，该怎么选</h2>
+
+<p>两个我都用过，各自有最适合的场景。</p>
+
+<p>Apollo 强在配置管理体验。Portal 界面比 Consul 的 KV UI 好用太多：有发布审核、灰度发布、版本回滚、操作审计。一个配置项从开发到上线有完整的生命周期管理。团队越大人越多，这些管控功能越重要。</p>
+
+<p>Consul 强在生态整合。KV 配置 + 服务发现 + 健康检查 + 多数据中心，一套东西解决多个问题。小团队不想维护太多中间件，Consul 一个就够了。</p>
+
+<p>Apollo 的缺点：部署重。至少四个模块——Config Service、Admin Service、Portal、MySQL。Consul 一个二进制就起来。另外 Apollo 的 .NET 客户端维护力度不如 Java 侧，版本更新慢。</p>
+
+<p>Consul 的缺点：配置管理功能简陋。没有审核流程，改了就生效。没有灰度发布。人多了容易出事——有一次同事手滑删了一个 KV 前缀，三个服务的配置瞬间丢失，好在有备份恢复。</p>
+
+<p>我们最终的组合：Apollo 管业务配置（短信模板、业务开关、费率参数），Consul 管基础设施配置（限流阈值、服务地址、健康检查参数）。这样各司其职，也避免了单点故障——Apollo 挂了不影响服务发现和健康检查，Consul 挂了不影响业务配置变更。</p>
+
+<h2>配置变更的安全策略</h2>
+
+<p>配置中心让变更变得容易，但也让误操作变得容易。一个配置 typo 可能让整个集群雪崩。我建立了以下规则：</p>
+
+<p>敏感配置和普通配置隔离。数据库密码、API 密钥这些不放 Apollo 公共 Namespace，用 Kubernetes Secret 注入环境变量。配置中心只放非敏感的业务配置。</p>
+
+<p>强制审批。Apollo 的公共 Namespace 开启发布审核，任何公共配置的变更需要至少一个人审批。私有 Namespace 不强制，但语义上不允许把本应私有的配置暴露为公共。</p>
+
+<p>灰度发布。Apollo 支持按 IP 灰度——先推给 10% 的实例，观察一段时间没有异常再全量发布。改第三方回调地址时这个功能救了命：灰度那台实例报 404，原来是地址多写了一个斜杠。全量推上去就是线上事故。</p>
+
+<p>变更通知。Apollo 的发布事件通过 Webhook 发到企业微信群，团队成员第一时间知道谁改了什么。不用等人手动通知。</p>
+
+<h2>配置版本和回滚</h2>
+
+<p>配置改坏了怎么办？Apollo 的配置每次发布形成一次 Release，Portal 上可以直接回滚到任意历史版本。这个功能的实现原理：每次发布时 Config Service 把当前 Namespace 的全量配置快照存到数据库的 Release 表，回滚就是把这个快照再发一次 Release。</p>
+
+<p>Apollo 不支持单条配置的回滚——如果你一次发布了 10 条配置的修改，回滚会把 10 条全退回去。这就要求发布粒度要小，一次只改一个 Namespace 的一个方面，回滚时不会误伤其他变更。</p>
+
+<p>Consul 没有原生的回滚功能。我的补救方案：写了一个定时脚本每小时 dump Consul KV 到 Git 仓库。需要回滚时从 Git 里找到目标版本，用 consul kv import 恢复。</p>
+
+<pre><code class="language-bash"># 备份脚本
+consul kv export -http-addr=localhost:8500 &gt; /backup/consul_kv_$(date +%Y%m%d_%H%M).json
+git add /backup/ && git commit -m "consul kv backup $(date)" && git push
+
+# 恢复
+consul kv import -http-addr=localhost:8500 @/backup/consul_kv_20210918_0300.json
+</code></pre>
+
+<h2>配置模型设计</h2>
+
+<p>配置多了会乱。我推荐建立三层模型：</p>
+
+<p>全局配置放公共 Namespace microservices.common。内容：基础设施地址（数据库、Redis、MQ）、全局开关（维护模式）、通用参数（分页大小上限）。</p>
+
+<p>应用私有配置放 application Namespace。内容：本服务的端口、日志级别、特定业务开关。</p>
+
+<p>环境差异配置通过 Cluster 隔离。DEV 的数据库地址和 PROD 不同，用 Cluster 区分而不是在配置 Key 里加环境前缀。</p>
+
+<p>关键原则：配置 Key 的层级和模块结构一一对应。看到 Sms:Provider 就知道是短信服务的运营商配置，而不是东一个西一个的平铺 Key。Apollo 的 Namespace 里没有嵌套结构支持，用冒号分隔的命名约定来模拟。</p>
+
+<p>配置中心上线半年后回头看，最直观的变化是：改配置从"申请变更窗口 → 走部署流程 → 40 分钟"变成了"Portal 上改 → 点发布 → 秒级生效"。运营同事自己就能改短信模板，不用再找开发。这个效率提升不是某个算法优化能比的——基础设施的改善往往比代码优化收益更大。</p>
+  </article>
+  <script src="../assets/js/common.js"></script>
+</body>
+</html>
