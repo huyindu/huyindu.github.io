@@ -1,0 +1,264 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>PostgreSQL 在 SaaS 系统中的高级用法 - HoEndo的技术博客</title>
+  <meta name="article-date" content="2022-01-10">
+  <meta name="article-tags" content="PostgreSQL,SaaS,数据库,.NET Core">
+  <meta name="description" content="分区表、JSONB 查询、全文搜索和物化视图在 .NET SaaS 系统中的实战应用">
+</head>
+<body>
+  <article class="post-content">
+    <h1>PostgreSQL 在 SaaS 系统中的高级用法</h1>
+
+<h2>日志表涨到一亿行</h2>
+
+<p>每天打开监控面板，audit_logs 表的数据量曲线像登山——从年初的 3000 万行到年尾突破 1.2 亿行。一个简单的 COUNT 查询从 50ms 涨到了 12 秒。这时候我才开始研究分区表，后悔没早点做。</p>
+
+<p>我们的 SaaS 系统跑在 PostgreSQL 14 上，后端用 EF Core 6.0 + Npgsql 6.0。审计日志、操作记录这类表天然按时间增长，不做分区就是定时炸弹。</p>
+
+<h2>分区表</h2>
+
+<p>PostgreSQL 14 支持声明式分区，创建语法很直接：</p>
+
+<pre><code class="language-sql">-- 创建分区主表
+CREATE TABLE audit_logs (
+    id BIGINT NOT NULL,
+    tenant_id INT NOT NULL,
+    user_id INT NOT NULL,
+    action VARCHAR(128) NOT NULL,
+    detail JSONB,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+) PARTITION BY RANGE (created_at);
+
+-- 按月创建分区
+CREATE TABLE audit_logs_202201
+    PARTITION OF audit_logs
+    FOR VALUES FROM ('2022-01-01') TO ('2022-02-01');
+
+CREATE TABLE audit_logs_202202
+    PARTITION OF audit_logs
+    FOR VALUES FROM ('2022-02-01') TO ('2022-03-01');
+
+-- 主键必须包含分区键
+ALTER TABLE audit_logs ADD PRIMARY KEY (id, created_at);
+</code></pre>
+
+<p>主键必须包含分区键，这是分区表的硬约束。很多人在这里犯错：原来的 audit_logs 主键是 id，迁移到分区表时必须把 created_at 也加进主键。如果业务上依赖 id 做全局唯一查找，加个唯一索引：</p>
+
+<pre><code class="language-sql">CREATE UNIQUE INDEX idx_audit_logs_id ON audit_logs (id, created_at);
+</code></pre>
+
+<p>分区管理要自动化。我在应用启动时跑一个迁移脚本，确保未来 3 个月的分区都建好了：</p>
+
+<pre><code class="language-csharp">public async Task EnsurePartitionsAsync(NpgsqlConnection conn)
+{
+    var sql = @"
+        DO $$
+        DECLARE
+            d DATE;
+        BEGIN
+            FOR d IN
+                SELECT generate_series(
+                    date_trunc('month', NOW()),
+                    date_trunc('month', NOW() + INTERVAL '3 months'),
+                    INTERVAL '1 month'
+                )::DATE
+            LOOP
+                EXECUTE format(
+                    'CREATE TABLE IF NOT EXISTS audit_logs_%s
+                     PARTITION OF audit_logs
+                     FOR VALUES FROM (%L) TO (%L)',
+                    to_char(d, 'YYYYMM'),
+                    d,
+                    d + INTERVAL '1 month'
+                );
+            END LOOP;
+        END $$;
+    ";
+    await conn.ExecuteAsync(sql);
+}
+</code></pre>
+
+<p>EF Core 对分区表的支持很弱——它不知道分区表的存在，所有查询都是对主表。好在 PostgreSQL 的查询规划器会自动把 WHERE created_at &gt;= '2022-03-01' 的条件推到对应的分区（Partition Pruning），只扫描需要的分区。但前提是 WHERE 条件里必须用到分区键。</p>
+
+<p>我碰到一个坑：查询 audit_logs WHERE user_id = 123 AND action = 'login'，没有 created_at 条件，PostgreSQL 扫描了全部分区。加上 created_at &gt;= NOW() - INTERVAL '30 days'，扫描的分区从 14 个降到 1 个。</p>
+
+<h2>JSONB 查询</h2>
+
+<p>SaaS 系统里不同租户的同一个功能可能需要存不同的扩展字段。传统的做法是 EAV（Entity-Attribute-Value）或预留一堆可空列，SQL 写起来像噩梦。PostgreSQL 的 JSONB 解决了这个问题。</p>
+
+<p>我们的订单表有一个 extra_data 的 JSONB 列，存租户自定义字段：</p>
+
+<pre><code class="language-json">{
+  "custom_field_1": "VIP客户",
+  "delivery_window": {"start": "09:00", "end": "12:00"},
+  "priority_level": 3
+}
+</code></pre>
+
+<p>在 EF Core 里用 Owned Entity + Value Conversion 映射 JSONB：</p>
+
+<pre><code class="language-csharp">public class Order
+{
+    public int Id { get; set; }
+    public int TenantId { get; set; }
+    public OrderExtraData ExtraData { get; set; }
+}
+
+public class OrderExtraData
+{
+    public string CustomField1 { get; set; }
+    public DeliveryWindow DeliveryWindow { get; set; }
+    public int PriorityLevel { get; set; }
+}
+
+// DbContext OnModelCreating
+modelBuilder.Entity&lt;Order&gt;()
+    .OwnsOne(o =&gt; o.ExtraData, b =&gt; b.ToJson());
+</code></pre>
+
+<p>原生 JSONB 查询用 Npgsql 的 EF.Functions：</p>
+
+<pre><code class="language-csharp">// 查询 priority_level = 3 的订单
+var orders = await _context.Orders
+    .Where(o =&gt; EF.Functions.JsonContains(
+        o.ExtraData,
+        new { priority_level = 3 }))
+    .ToListAsync();
+
+// JSONB 路径查询
+var vips = await _context.Orders
+    .FromSqlRaw(@"
+        SELECT * FROM orders
+        WHERE extra_data ->> 'custom_field_1' = 'VIP客户'")
+    .ToListAsync();
+</code></pre>
+
+<p>JSONB 查询要建 GIN 索引，否则全表扫描：</p>
+
+<pre><code class="language-sql">CREATE INDEX idx_orders_extra_data ON orders USING GIN (extra_data jsonb_path_ops);
+</code></pre>
+
+<p>jsonb_path_ops 比默认的 jsonb_ops 省空间——只索引路径不索引值，对于 contains 查询（@&gt;）效率一样但索引体积小 30%。缺点是不支持键存在查询（? operator），但我们的查询场景不需要。</p>
+
+<p>我用过 JSONB 最大的体会：不要往 JSONB 里塞高频查询的字段。priority_level 如果出现在 90% 的查询条件里，就该拿出来做独立列。JSONB 适合低频查询的扩展字段。</p>
+
+<h2>全文搜索</h2>
+
+<p>工单系统需要支持租户内全文搜索。Elasticsearch 太重，PostgreSQL 自带的全文搜索刚好够用。</p>
+
+<p>建表时加一个 tsvector 列：</p>
+
+<pre><code class="language-sql">-- 不加 STORED 是虚拟列，不占存储但在查询时动态计算
+ALTER TABLE tickets ADD COLUMN search_vector tsvector
+    GENERATED ALWAYS AS (
+        setweight(to_tsvector('simple', coalesce(title, '')), 'A') ||
+        setweight(to_tsvector('simple', coalesce(description, '')), 'B')
+    ) STORED;
+
+CREATE INDEX idx_tickets_search ON tickets USING GIN (search_vector);
+</code></pre>
+
+<p>分词器选了 simple 而不是 chinese。PG 内置的中文分词是逐字切分，"工单系统"变成"工"、"单"、"系"、"统"，查"工单"能命中但查"系统建设"也能命中。用 zhparser 扩展可以装结巴分词，但安装麻烦且升级 PG 版本时经常不兼容。取舍之下 simple 足够——工单标题和描述都不长，逐字切分的召回率在我们的场景下够用。</p>
+
+<p>搜索查询：</p>
+
+<pre><code class="language-csharp">var query = "发票申请";
+var tickets = await _context.Tickets
+    .Where(t =&gt; t.TenantId == tenantId
+        &amp;&amp; t.SearchVector.Matches(EF.Functions.ToTsQuery("simple", query)))
+    .OrderByDescending(t =&gt; t.SearchVector.Rank(
+        EF.Functions.ToTsQuery("simple", query)))
+    .Take(20)
+    .ToListAsync();
+</code></pre>
+
+<p>Npgsql 的 EF.Functions.ToTsQuery 和 Matches 方法直接映射到 PostgreSQL 的 @@ 运算符和 ts_rank 排序，生成的 SQL 很干净。</p>
+
+<h2>物化视图</h2>
+
+<p>管理后台的统计面板需要展示每个租户的日订单量、月营收、活跃用户数。原始 SQL 要 JOIN 三张大表再 GROUP BY，高峰期跑一次 15 秒。管理后台又不是实时系统，15 秒等不起。</p>
+
+<p>物化视图把查询结果存成物理表：</p>
+
+<pre><code class="language-sql">CREATE MATERIALIZED VIEW mv_tenant_daily_stats AS
+SELECT
+    tenant_id,
+    order_date,
+    COUNT(*) AS order_count,
+    SUM(amount) AS revenue,
+    COUNT(DISTINCT user_id) AS active_users
+FROM orders
+WHERE created_at &gt;= CURRENT_DATE - INTERVAL '90 days'
+GROUP BY tenant_id, order_date;
+
+CREATE UNIQUE INDEX idx_mv_tenant_stats ON mv_tenant_daily_stats (tenant_id, order_date);
+</code></pre>
+
+<p>查询从 15 秒降到 30ms。但物化视图的数据是快照，不会自动更新。需要定时刷新：</p>
+
+<pre><code class="language-sql">REFRESH MATERIALIZED VIEW CONCURRENTLY mv_tenant_daily_stats;
+</code></pre>
+
+<p>CONCURRENTLY 关键字很关键——不用它会锁住视图，刷新期间所有查询都阻塞。用了 CONCURRENTLY 允许查询继续读旧数据，但代价是必须有唯一索引且刷新过程更长。</p>
+
+<p>我在 Hangfire 里注册了一个每 30 分钟执行一次的任务：</p>
+
+<pre><code class="language-csharp">RecurringJob.AddOrUpdate(
+    "refresh-materialized-views",
+    () =&gt; _db.Database.ExecuteSqlRawAsync(
+        "REFRESH MATERIALIZED VIEW CONCURRENTLY mv_tenant_daily_stats"),
+    "*/30 * * * *");
+</code></pre>
+
+<h2>管道查询模式（PG 14 新特性）</h2>
+
+<p>PostgreSQL 14 新增了管道查询模式（pipeline mode）。传统的查询模式是发一条 SQL → 等结果 → 发下一条，网络往返次数等于查询次数。管道模式允许批量发送多条查询，一次性接收所有结果，减少网络往返。</p>
+
+<p>Npgsql 6.0 原生支持：</p>
+
+<pre><code class="language-csharp">await using var cmd1 = new NpgsqlCommand("SELECT COUNT(*) FROM orders WHERE tenant_id = @t1", conn);
+await using var cmd2 = new NpgsqlCommand("SELECT COUNT(*) FROM users WHERE tenant_id = @t1", conn);
+cmd1.Parameters.AddWithValue("t1", tenantId);
+cmd2.Parameters.AddWithValue("t1", tenantId);
+
+var batch = conn.CreateBatch();
+batch.BatchCommands.Add(new NpgsqlBatchCommand(cmd1));
+batch.BatchCommands.Add(new NpgsqlBatchCommand(cmd2));
+
+await using var reader = await batch.ExecuteReaderAsync();
+
+// 读取第一个结果集
+var orderCount = 0L;
+while (await reader.ReadAsync()) orderCount = reader.GetInt64(0);
+
+// 切换到第二个结果集
+await reader.NextResultAsync();
+var userCount = 0L;
+while (await reader.ReadAsync()) userCount = reader.GetInt64(0);
+</code></pre>
+
+<p>在统计面板这种需要发一串查询的场景里，管道模式把网络往返从 6 次降到 1 次，响应时间缩短了 40%。</p>
+
+<h2>EF Core 6 的编译模型</h2>
+
+<p>EF Core 6 新增的 Compiled Models 能提升启动速度：</p>
+
+<pre><code class="language-bash">dotnet ef dbcontext optimize
+    --output-dir CompiledModels
+    --namespace MyApp.CompiledModels
+</code></pre>
+
+<pre><code class="language-csharp">// DbContext 里启用
+optionsBuilder.UseModel(MyApp.CompiledModels.AppDbContextModel.Instance);
+</code></pre>
+
+<p>第一次查询的冷启动时间从 800ms 降到了 200ms。微服务里每个 Pod 启动都要经历一次冷启动，这个优化在频繁扩缩容时感受明显。</p>
+
+<p>从遇到日志表瓶颈，到逐步把分区表、JSONB、全文搜索、物化视图配齐，花了大概两周。PostgreSQL 的这些高级特性不是"到用的时候再学"，而是应该在架构设计里就预留。尤其是分区表——等数据到了上亿行再来改表结构，迁移的停机时间会让人崩溃。我那次迁移选择了凌晨三点锁表 40 分钟，发了一条诚恳的停机公告。下次再有新系统，表的设计文档里一定有分区策略这一节。</p>
+  </article>
+  <script src="../assets/js/common.js"></script>
+</body>
+</html>

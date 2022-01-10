@@ -1,6 +1,18 @@
 var POSTS_DATA = 
 [
   {
+    "title": "PostgreSQL 在 SaaS 系统中的高级用法",
+    "slug": "2022-01-10-postgresql-advanced-saas",
+    "date": "2022-01-10",
+    "tags": [
+      "PostgreSQL",
+      "SaaS",
+      "数据库",
+      ".NET Core"
+    ],
+    "summary": "分区表、JSONB 查询、全文搜索和物化视图在 .NET SaaS 系统中的实战应用"
+  },
+  {
     "title": "微服务下的分布式配置中心设计",
     "slug": "2021-09-19-distributed-config-center-microservice",
     "date": "2021-09-19",
