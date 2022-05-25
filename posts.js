@@ -1,6 +1,18 @@
 var POSTS_DATA = 
 [
   {
+    "title": "Kafka 在 .NET 中的流式消息处理",
+    "slug": "2022-05-25-kafka-streaming-dotnet",
+    "date": "2022-05-25",
+    "tags": [
+      "Kafka",
+      ".NET",
+      "流处理",
+      "消息队列"
+    ],
+    "summary": "使用 Confluent.Kafka 在 .NET 中实现流式消息处理，消费者组和 Exactly-Once 语义"
+  },
+  {
     "title": "PostgreSQL 在 SaaS 系统中的高级用法",
     "slug": "2022-01-10-postgresql-advanced-saas",
     "date": "2022-01-10",
