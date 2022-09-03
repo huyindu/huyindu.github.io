@@ -1,6 +1,18 @@
 var POSTS_DATA = 
 [
   {
+    "title": "多租户 SaaS 数据隔离方案对比",
+    "slug": "2022-09-03-multi-tenant-data-isolation-saas",
+    "date": "2022-09-03",
+    "tags": [
+      "SaaS",
+      "多租户",
+      "数据隔离",
+      "EF Core"
+    ],
+    "summary": "对比独立数据库、共享数据库独立 Schema、共享表三种方案，用 EF Core 实现多租户"
+  },
+  {
     "title": "Kafka 在 .NET 中的流式消息处理",
     "slug": "2022-05-25-kafka-streaming-dotnet",
     "date": "2022-05-25",

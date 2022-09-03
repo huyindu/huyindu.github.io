@@ -1,0 +1,104 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>多租户 SaaS 数据隔离方案对比 - HoEndo的技术博客</title>
+  <meta name="article-date" content="2022-09-03">
+  <meta name="article-tags" content="SaaS,多租户,数据隔离,EF Core">
+  <meta name="description" content="对比独立数据库、共享数据库独立 Schema、共享表三种方案，用 EF Core 实现多租户">
+</head>
+<body>
+  <article class="post-content">
+    <h1>多租户 SaaS 数据隔离方案对比</h1>
+
+    <h2>为什么纠结</h2>
+    <p>给一个企业级 SaaS 做技术选型的时候，数据隔离方案我纠结了很久。三种主流方案——独立数据库、共享数据库独立 Schema、共享表——各有各的坑，不是简单"选个最安全的"就能收工。当时那套系统用 .NET 6 和 PostgreSQL 14，EF Core 6.0 刚出了 DbContextFactory 和 Compiled Models，给共享表方案加了不少底气。最后选了共享表+租户ID列，理由和踩坑过程如下。</p>
+
+    <h2>方案一：独立数据库——贵但最安全</h2>
+    <p>每个租户一个 PostgreSQL database。Schema 完全一样，只是物理隔离。</p>
+    <p>优点很直白：隔离级别最高，一个租户的查询再烂也拖不垮别人；数据备份和恢复可以按租户粒度操作；大客户审计要求能轻松满足。缺点也直白：贵。每个 database 都有固定开销，租户数上去了运维成本线性增长。迁移（EF Core migration）要跑 N 次。连接池管理麻烦——每个租户一个连接字符串，连接数可能爆炸。</p>
+    <p>实现上，需要维护一个租户到连接字符串的映射表（租户元数据库），每次请求根据租户标识查映射，动态构造 DbContext。EF Core 6 的 DbContextFactory 能帮忙管理生命周期，但解决不了连接数问题。</p>
+
+    <h2>方案二：共享数据库独立 Schema——折中但运维复杂</h2>
+    <p>所有租户共用一个 database，但每个租户有自己的 schema（PostgreSQL namespace）。表名一样，路径不同：<code>tenant_a.orders</code>、<code>tenant_b.orders</code>。</p>
+    <p>隔离级别介于独立库和共享表之间。PostgreSQL 的 schema 天然有权限边界，可以限制租户 A 无法访问租户 B 的表。迁移可以批量跑（遍历所有 schema 执行同一套 migration）。</p>
+    <p>坑在运维：PostgreSQL 默认的 <code>search_path</code> 是 <code>"$user", public</code>，每次查询都要 set search_path 或者用完全限定表名。EF Core 对动态 schema 的支持很弱——表名映射在 <code>OnModelCreating</code> 里就定死了，要动态切换得用拦截器劫持 SQL 把表名替换掉，或者每个租户创建一个 Model。另一个坑是 schema 数量上限：几百个租户还好，几千个租户之后 pg_catalog 膨胀得厉害，<code>\dn</code> 都会卡。</p>
+
+    <h2>方案三：共享表+租户ID列——简单但有隐形成本</h2>
+    <p>所有租户的数据存在同一张表里，靠一个 <code>tenant_id</code> 列区分。我最终选的就是这个。</p>
+    <p>核心实现就两步。第一步，所有实体实现一个接口：</p>
+    <pre><code class="language-csharp">public interface ITenantEntity
+{
+    Guid TenantId { get; set; }
+}
+
+public class Order : ITenantEntity
+{
+    public Guid Id { get; set; }
+    public Guid TenantId { get; set; }
+    public decimal Amount { get; set; }
+}</code></pre>
+    <p>第二步，EF Core 的全局查询过滤器：</p>
+    <pre><code class="language-csharp">protected override void OnModelCreating(ModelBuilder builder)
+{
+    foreach (var entity in builder.Model.GetEntityTypes()
+        .Where(e => typeof(ITenantEntity).IsAssignableFrom(e.ClrType)))
+    {
+        builder.Entity(entity.ClrType)
+            .HasQueryFilter(e => EF.Property&lt;Guid&gt;(e, "TenantId") == _tenantId);
+    }
+}</code></pre>
+    <p><code>_tenantId</code> 从当前请求上下文注入。配合 EF Core 6 的 DbContextFactory，每个请求创建独立的 DbContext 实例，<code>_tenantId</code> 天然隔离。</p>
+    <p>索引设计是重头戏。所有查询都带 <code>WHERE tenant_id = @p0</code>，所以租户 ID 必须放在复合索引最左边：</p>
+    <pre><code class="language-sql">CREATE INDEX idx_orders_tenant_created 
+ON orders (tenant_id, created_at DESC);</code></pre>
+    <p>不这么建的话，tenant_id 过滤走不上索引，全表扫描能把你数据库打穿。</p>
+
+    <h2>隐形成本：数据量、误操作、大租户</h2>
+    <p>共享表最大的风险不在技术上，在人的失误上。写 SQL 忘了加 <code>WHERE tenant_id</code>，UPDATE 刷了全表——这种事故我在测试环境亲手制造过一次，好在测试环境数据少且是假的。</p>
+    <p>防御措施：一，EF Core 的查询过滤器已经是强制性的，除非显式调用 <code>IgnoreQueryFilters()</code>；二，用 PostgreSQL 的 RLS（Row Level Security）做数据库层面的最后防线：</p>
+    <pre><code class="language-sql">ALTER TABLE orders ENABLE ROW LEVEL SECURITY;
+CREATE POLICY tenant_isolation ON orders
+    USING (tenant_id = current_setting('app.current_tenant_id')::uuid);</code></pre>
+    <p>每次连接开始时执行 <code>SET app.current_tenant_id = '&lt;tenant-id&gt;'</code>，PG 在内核层面拒绝跨租户访问。双重保险。</p>
+    <p>另一个问题是"大租户效应"。一个租户数据量是其他租户的 100 倍，它的查询会拖慢整张表。我的缓解策略：表分区（按 tenant_id 哈希分区），PostgreSQL 14 的原生分区表性能已经足够好；对超大租户单独建表空间放到 SSD 上；业务层对大租户的批量查询做限流。</p>
+
+    <h2>迁移策略</h2>
+    <p>我用过独立库和共享表两种模式，迁移体验天差地别。独立库时，一个 migration 要跑 N 遍（N=租户数），CI 里跑一次 migration 脚本要十几分钟。共享表方案只跑一次，CI 一分钟结束。</p>
+    <p>共享表的 migration 唯一要注意的是：加非空列必须给默认值，否则已有租户的数据行会炸。常用套路：</p>
+    <pre><code class="language-csharp">migrationBuilder.AddColumn&lt;string&gt;(
+    name: "NewColumn",
+    table: "Orders",
+    nullable: true,
+    defaultValue: "placeholder"
+);
+// 之后再来一个 migration 改成 nullable: false</code></pre>
+
+    <h2>选型决策框架</h2>
+    <p>我推荐按租户数量和安全要求组合决策：</p>
+    <ul>
+      <li>租户 &lt; 100 且安全要求高 → 独立数据库</li>
+      <li>租户 100 ~ 1000 且安全要求高 → 独立 Schema</li>
+      <li>租户 &gt; 1000 或安全要求一般 → 共享表 + 租户ID列</li>
+    </ul>
+    <p>我的场景是几百个中小租户，安全要求中等（不是金融/医疗），共享表+RLS 的组合最划算。</p>
+
+    <h2>发现：EF Core 6 的两个关键特性</h2>
+    <p>DbContextFactory 让每次请求创建新的 DbContext 变得非常干净，配合 <code>AddDbContextFactory</code> 注册，构造函数直接注入：</p>
+    <pre><code class="language-csharp">public class OrderService
+{
+    private readonly IDbContextFactory&lt;AppDbContext&gt; _factory;
+    
+    public async Task&lt;List&lt;Order&gt;&gt; GetOrdersAsync()
+    {
+        await using var ctx = await _factory.CreateDbContextAsync();
+        return await ctx.Orders.ToListAsync();
+    }
+}</code></pre>
+    <p>Compiled Models 对大租户的冷启动有帮助。正常 EF Core 第一次查询要编译模型，大模型可能卡一两秒。用 <code>dotnet ef dbcontext optimize</code> 生成预编译模型之后，首次查询下降到几十毫秒。</p>
+    <p>我的最终架构：<code>tenant_id</code> 通过 JWT claim 传递，中间件解析后注入 scoped 服务，DbContextFactory 从 scoped 服务取租户 ID 创建 DbContext。RLS 作为额外保险。索引全部以 tenant_id 开头。这套跑了半年，经历过一次大租户的促销流量高峰，PostgreSQL 14 的哈希分区把热点数据分散得挺好，查询延迟没明显上升。</p>
+  </article>
+  <script src="../assets/js/common.js"></script>
+</body>
+</html>
