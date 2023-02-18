@@ -1,0 +1,177 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Loki + NLog + Grafana：.NET 微服务轻量化日志系统 - HoEndo的技术博客</title>
+  <meta name="article-date" content="2023-02-18">
+  <meta name="article-tags" content="Loki,Grafana,NLog,日志系统">
+  <meta name="description" content="用 Loki + NLog + Grafana 搭建轻量级日志收集和查询系统，替代 ELK 降低运维成本">
+</head>
+<body>
+  <article class="post-content">
+    <h1>Loki + NLog + Grafana：.NET 微服务轻量化日志系统</h1>
+
+    <h2>ELK 吃了我 8 GB 内存</h2>
+    <p>之前用 ELK（Elasticsearch + Logstash + Kibana）做日志收集，三台 4 GB 的小服务器上 Elasticsearch 一个进程吃了 3 GB，Logstash 又吃掉 1 GB，剩下的内存根本不够业务用。Java 进程的堆内存调小就 OOM，调大就挤占系统。运维成本比日志本身的价值还高——团队就三个人，每天还要抽时间伺候这套日志系统。</p>
+    <p>2023 年初决定切到 Loki。Grafana Loki 2.7 已经支持 TSDB 索引（2022 年末引入的实验特性在 2.7 稳定了），查询性能比早年的 BoltDB 索引好一截。NLog 5.1 的 Loki target 社区维护得不错。Grafana 9.3 在前端查询体验上已经非常成熟。整套方案跑在 1 GB 内存的容器里绰绰有余。</p>
+
+    <h2>架构：省掉一半组件</h2>
+    <p>ELK 的典型架构：Filebeat 采集 → Logstash 解析/过滤/转换 → Elasticsearch 存储索引 → Kibana 查询。四个组件都要运维。</p>
+    <p>Loki 的架构：Promtail（或直接 NLog target）推日志 → Loki 存储 → Grafana 查询。三个组件，而且 Loki 和 Grafana 本来就是同一生态的东西，部署在一起天然兼容。</p>
+    <p>最关键的区别：Loki 不索引日志内容，只索引标签（labels）。日志正文存在对象存储或本地磁盘，查询时按标签过滤再扫描匹配的 chunk。这意味着写吞吐高、存储成本低——代价是全文搜索比 ES 慢，但 99% 的日志查询场景是"某个服务在某个时间段的错误日志"，不是"在所有服务里全文搜一个关键词"。</p>
+
+    <h2>部署 Loki + Grafana</h2>
+    <p>docker-compose 一把起：</p>
+    <pre><code class="language-yaml">version: '3'
+services:
+  loki:
+    image: grafana/loki:2.7
+    ports:
+      - "3100:3100"
+    volumes:
+      - ./loki-config.yaml:/etc/loki/local-config.yaml
+    command: -config.file=/etc/loki/local-config.yaml
+
+  grafana:
+    image: grafana/grafana:9.3
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+    volumes:
+      - grafana-storage:/var/lib/grafana</code></pre>
+    <p>loki-config.yaml 重点配置：</p>
+    <pre><code class="language-yaml">auth_enabled: false
+
+server:
+  http_listen_port: 3100
+
+ingester:
+  lifecycler:
+    ring:
+      kvstore:
+        store: inmemory
+      replication_factor: 1
+  chunk_idle_period: 5m
+  chunk_retain_period: 30s
+
+schema_config:
+  configs:
+    - from: 2023-01-01
+      store: tsdb
+      object_store: filesystem
+      schema: v12
+      index:
+        prefix: loki_index_
+        period: 24h
+
+storage_config:
+  tsdb_shipper:
+    active_index_directory: /loki/tsdb-index
+    cache_location: /loki/tsdb-cache
+  filesystem:
+    directory: /loki/chunks</code></pre>
+    <p><code>store: tsdb</code> 是 2.7 的新特性，比旧的 boltdb-shipper 查询延迟降低约 40%。<code>replication_factor: 1</code> 是因为单节点部署，不需要副本。</p>
+
+    <h2>NLog 推送日志到 Loki</h2>
+    <p>.NET 7 项目里装两个 NuGet 包：<code>NLog</code>（5.1）和 <code>NLog.Loki</code>（社区维护的 Loki target）。</p>
+    <p>nlog.config：</p>
+    <pre><code class="language-xml">&lt;?xml version="1.0" encoding="utf-8" ?&gt;
+&lt;nlog xmlns="http://www.nlog-project.org/schemas/NLog.xsd"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"&gt;
+  &lt;extensions&gt;
+    &lt;add assembly="NLog.Loki"/&gt;
+  &lt;/extensions&gt;
+  &lt;targets&gt;
+    &lt;target name="loki" xsi:type="loki"
+            endpoint="http://localhost:3100"
+            compression="gzip"
+            layout="${longdate}|${level:uppercase=true}|${logger}|${message} ${exception:format=toString}"&gt;
+      &lt;label name="app" layout="${configsetting:AppName}"/&gt;
+      &lt;label name="env" layout="${configsetting:Environment}"/&gt;
+      &lt;label name="level" layout="${level}"/&gt;
+    &lt;/target&gt;
+  &lt;/targets&gt;
+  &lt;rules&gt;
+    &lt;logger name="*" minlevel="Info" writeTo="loki"/&gt;
+  &lt;/rules&gt;
+&lt;/nlog&gt;</code></pre>
+    <p>标签设计是 Loki 使用体验的核心。label 太少 → 查询慢（chunk 过滤不精准）。label 太多 → 索引膨胀（Loki 对高基数 label 敏感）。我的实践：<code>app</code>（哪个服务）、<code>env</code>（哪个环境）、<code>level</code>（日志级别）。请求 ID 或用户 ID 这种高基数值绝对不要放 label——放日志正文里，用 LogQL 的 <code>|=</code> 过滤。</p>
+
+    <h2>LogQL 查询</h2>
+    <p>Grafana 里配好 Loki 数据源（URL: <code>http://loki:3100</code>），打开 Explore 就能查。</p>
+    <p>常用查询模式：</p>
+    <pre><code class="language-logql"># 某个服务的错误日志
+{app="order-service", level="Error"}
+
+# 排除健康检查的噪音
+{app="order-service"} |!= "/health"
+
+# 按时间聚合（近 5 分钟）
+rate({app="order-service", level="Error"}[5m])
+
+# 搜特定关键词
+{app="gateway"} |= "timeout"</code></pre>
+    <p>Grafana 9.3 的 Explore 支持自动补全标签名和标签值，写 LogQL 几乎不需要记忆语法。</p>
+
+    <h2>结构化日志：从纯文本到 JSON</h2>
+    <p>用了一段时间纯文本日志后我发现 Loki 查询里的 <code>|=</code> 正则匹配不太可靠——日志格式稍微变化就搜不到。改成结构化日志（JSON）：</p>
+    <pre><code class="language-csharp">public static IHostBuilder UseNLogJson(this IHostBuilder builder)
+{
+    return builder.ConfigureLogging(logging =>
+    {
+        logging.ClearProviders();
+        LogManager.Setup()
+            .LoadConfiguration(builder => builder
+                .WriteToLoki(loki =>
+                {
+                    loki.Endpoint = "http://localhost:3100";
+                    loki.Layout = new JsonLayout
+                    {
+                        Attributes =
+                        {
+                            new JsonAttribute("timestamp", "${longdate}"),
+                            new JsonAttribute("level", "${level:uppercase=true}"),
+                            new JsonAttribute("message", "${message}"),
+                            new JsonAttribute("exception", "${exception:format=toString}"),
+                            new JsonAttribute("traceId", "${mdlc:TraceId}"),
+                            new JsonAttribute("spanId", "${mdlc:SpanId}")
+                        }
+                    };
+                    loki.Labels.Add(new LokiLabel("app", "${configsetting:AppName}"));
+                    loki.Labels.Add(new LokiLabel("env", "${configsetting:Environment}"));
+                    loki.Labels.Add(new LokiLabel("level", "${level}"));
+                })
+            );
+    });
+}</code></pre>
+    <p>JSON 日志进 Loki 后可以用 LogQL 的 JSON parser 按字段查询：<code>{app="order-service"} | json | traceId="abc123"</code>。合并 OpenTelemetry 的 TraceId 进去之后，链路追踪和日志查询能联动——但这个留到另一篇文章再写。</p>
+
+    <h2>资源对比：实打实的数字</h2>
+    <p>我的场景：6 个 .NET 微服务，日均日志量约 5 GB。</p>
+    <table>
+      <tr><th></th><th>ELK</th><th>Loki</th></tr>
+      <tr><td>内存占用</td><td>8.2 GB</td><td>940 MB</td></tr>
+      <tr><td>磁盘 (7天)</td><td>38 GB</td><td>12 GB</td></tr>
+      <tr><td>CPU 平均</td><td>45%</td><td>8%</td></tr>
+      <tr><td>启动时间</td><td>~2 分钟</td><td>~3 秒</td></tr>
+    </table>
+    <p>磁盘差异来自 Loki 的压缩——日志 chunk 用 gzip 压缩（2.7 还支持 snappy），Elasticsearch 要建倒排索引，原始日志膨胀得厉害。</p>
+
+    <h2>缺点：该说清楚的</h2>
+    <p>Loki 不适合全文搜索密集型场景。如果你需要经常在几 TB 日志里做复杂的全文检索（比如安全审计），Elasticsearch 仍然是最好的选择。但如果你只是在查"某服务某时间段的错误"并偶尔按关键词过滤，Loki 是更合适的工具。</p>
+    <p>另一个实际碰到的问题：Promtail 的 pipeline 没有 Logstash 那么强大的日志解析能力。复杂日志格式（比如 Java 堆栈的多行合并）配起来比较麻烦。好在 NLog 直接推 JSON 绕过了这个问题。</p>
+
+    <h2>监控告警</h2>
+    <p>Grafana 9.x 的 Alerting 已经直接集成 Loki 数据源。ERROR 日志数量超过阈值就告警，不用额外部署 AlertManager：</p>
+    <pre><code class="language-yaml"># Alert Rule
+expr: |
+  sum(rate({env="prod"} |~ "Error|Fatal" [5m])) by (app) > 0.1
+for: 1m</code></pre>
+    <p>配上飞书 Webhook，出问题两分钟内通知到群里。</p>
+    <p>部署后的半年里，这套系统没出过任何一次内存不足或磁盘爆满的问题。省下来的运维精力其实比省下来的硬件成本更值钱——日志系统真正变成了一个设好就忘的基础设施，而不是需要持续维护的噩梦。</p>
+  </article>
+  <script src="../assets/js/common.js"></script>
+</body>
+</html>

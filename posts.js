@@ -1,6 +1,18 @@
 var POSTS_DATA = 
 [
   {
+    "title": "Loki + NLog + Grafana：.NET 微服务轻量化日志系统",
+    "slug": "2023-02-18-loki-nlog-grafana-dotnet-logging",
+    "date": "2023-02-18",
+    "tags": [
+      "Loki",
+      "Grafana",
+      "NLog",
+      "日志系统"
+    ],
+    "summary": "用 Loki + NLog + Grafana 搭建轻量级日志收集和查询系统，替代 ELK 降低运维成本"
+  },
+  {
     "title": "多租户 SaaS 数据隔离方案对比",
     "slug": "2022-09-03-multi-tenant-data-isolation-saas",
     "date": "2022-09-03",
