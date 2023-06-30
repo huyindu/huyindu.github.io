@@ -1,6 +1,18 @@
 var POSTS_DATA = 
 [
   {
+    "title": "Quartz.NET 分布式任务调度实战",
+    "slug": "2023-06-30-quartznet-distributed-scheduling",
+    "date": "2023-06-30",
+    "tags": [
+      "Quartz.NET",
+      "任务调度",
+      ".NET",
+      "分布式"
+    ],
+    "summary": "基于 Quartz.NET 实现分布式定时任务调度，集成数据库持久化和集群故障转移"
+  },
+  {
     "title": "Loki + NLog + Grafana：.NET 微服务轻量化日志系统",
     "slug": "2023-02-18-loki-nlog-grafana-dotnet-logging",
     "date": "2023-02-18",

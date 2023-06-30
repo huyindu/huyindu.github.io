@@ -1,0 +1,129 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Quartz.NET 分布式任务调度实战 - HoEndo的技术博客</title>
+  <meta name="article-date" content="2023-06-30">
+  <meta name="article-tags" content="Quartz.NET,任务调度,.NET,分布式">
+  <meta name="description" content="基于 Quartz.NET 实现分布式定时任务调度，集成数据库持久化和集群故障转移">
+</head>
+<body>
+  <article class="post-content">
+    <h1>Quartz.NET 分布式任务调度实战</h1>
+
+    <h2>从 Hangfire 切过来的原因</h2>
+    <p>2023 年中的时候，我把项目里的定时任务从 Hangfire 迁到了 Quartz.NET 3.6。Hangfire 是挺好的产品——Dashboard 直观、重试机制开箱即用、社区活跃。但两个问题让我最终决定换：一是 cron 表达式的粒度。Quartz.NET 支持秒级 cron（7 位），Hangfire 只到分钟级（5 位）。我的场景里有报表任务需要"每小时第 5 分 30 秒执行"，Hangfire 做不到精确控制。二是 Hangfire 的持久化依赖 Redis 或 SQL Server，而我们的基础设施统一用 PostgreSQL 15，多维护一个 Redis 实例只是为了任务调度，性价比太低。</p>
+    <p>Quartz.NET 3.6 在 ASP.NET Core 集成上已经很成熟了，集群模式基于数据库行锁，不需要 ZooKeeper 之类的额外组件。</p>
+
+    <h2>单节点起步：最低可用配置</h2>
+    <p>NuGet 装 <code>Quartz.Extensions.Hosting</code>，Startup 里注册：</p>
+    <pre><code class="language-csharp">services.AddQuartz(q =>
+{
+    q.UsePersistentStore(s =>
+    {
+        s.UsePostgres("Host=localhost;...");
+        s.UseNewtonsoftJsonSerializer();
+    });
+
+    var jobKey = new JobKey("DailyReport", "reports");
+    q.AddJob&lt;DailyReportJob&gt;(jobKey);
+
+    q.AddTrigger(t => t
+        .ForJob(jobKey)
+        .WithIdentity("DailyReportTrigger", "reports")
+        .WithCronSchedule("30 5 * * * ?", cs => cs
+            .InTimeZone(TimeZoneInfo.FindSystemTimeZoneById("Asia/Shanghai"))
+            .WithMisfireHandlingInstructionFireAndProceed()));
+});
+
+services.AddQuartzHostedService(q => q.WaitForJobsToComplete = true);</code></pre>
+    <p><code>WaitForJobsToComplete = true</code> 保证应用关闭时正在执行的任务不被硬杀。这个细节特别重要——一个跑了一半的报表任务被 SIGTERM 干掉，数据库可能留下半成品数据。</p>
+    <p>Job 实现就是实现 <code>IJob</code> 接口：</p>
+    <pre><code class="language-csharp">public class DailyReportJob : IJob
+{
+    private readonly ReportService _service;
+    private readonly ILogger&lt;DailyReportJob&gt; _logger;
+
+    public Task Execute(IJobExecutionContext context)
+    {
+        _logger.LogInformation("Report generation started at {Time}", DateTimeOffset.Now);
+        return _service.GenerateDailyReportAsync();
+    }
+}</code></pre>
+
+    <h2>分布式集群：数据库行锁为核心</h2>
+    <p>多节点部署时，同一个 Job 不能同时在两个节点上执行。Quartz.NET 的集群方案用数据库表 <code>qrtz_fired_triggers</code> 和 <code>qrtz_locks</code> 做分布式锁。配置上只需在 <code>UsePersistentStore</code> 里加一行：</p>
+    <pre><code class="language-csharp">q.UsePersistentStore(s =>
+{
+    s.UsePostgres("Host=...");
+    s.UseNewtonsoftJsonSerializer();
+    s.UseClustering(c =>
+    {
+        c.CheckinInterval = TimeSpan.FromSeconds(15);
+        c.CheckinMisfireThreshold = TimeSpan.FromSeconds(30);
+    });
+});</code></pre>
+    <p>Quartz.NET 的 scheduler 实例（每个节点一个）通过 <code>qrtz_scheduler_state</code> 做心跳。默认 checkin interval 是 15 秒，如果一个节点超过 30 秒没心跳（即 misfire threshold），其他节点会接管它的 trigger。</p>
+    <p>数据库表结构由 Quartz.NET 的 SQL 脚本创建。PostgreSQL 的标准脚本在 quartz 源码仓库的 <code>database/tables/tables_postgres.sql</code>，我直接用 ef core migration 包了一层，这样数据库初始化和业务表迁移能一起管理。</p>
+
+    <h2>坑一：时区一致性</h2>
+    <p>我踩过坑：服务器系统时区是 UTC，应用容器是 UTC，但 crontab 里写的是北京时间。结果任务在凌晨 5:30 UTC（北京时间 13:30）执行，不是预期的上午 8:00。排查了两天才发现是时区不一致。解决办法是两个层面：</p>
+    <p>一，trigger 定义里显式指定时区（上面代码里的 <code>InTimeZone</code>）。二，PostgreSQL 连接字符串加 <code>Timezone=Asia/Shanghai</code>，oracle 风格。</p>
+    <p>所有节点必须用相同的时区配置，否则一个节点的 misfire 判定和另一个节点的执行时间对不上。</p>
+
+    <h2>坑二：长任务和 Block 问题</h2>
+    <p>有个数据同步任务偶尔跑超过 10 分钟，新 trigger 触发时上一次还在跑。默认行为是 <code>WithMisfireHandlingInstructionFireAndProceed()</code>——积压的任务会立即执行，导致并发跑两个实例。两个实例同时写同一张表，产生了死锁。</p>
+    <p>解决办法是把 Job 标记为 <code>[DisallowConcurrentExecution]</code>：</p>
+    <pre><code class="language-csharp">[DisallowConcurrentExecution]
+public class LongRunningJob : IJob { ... }</code></pre>
+    <p>这个特性告诉 Quartz：同一 JobKey 的实例不能并发执行。新 trigger 触发时会排队等待上一个实例完成。代价是如果任务卡死，后续任务永远排队——需要配合超时机制。</p>
+
+    <h2>坑三：数据库连接池耗尽</h2>
+    <p>生产环境跑了 50 个 Job（分散在各节点），高峰期 Quartz.NET 每个 Job 占用一个数据库连接做锁检查和状态更新。PostgreSQL 默认连接数 100，加上业务请求，连接池偶尔被打满。</p>
+    <p>排查发现 <code>UsePostgres</code> 的默认连接池策略是为每个 scheduler 开一个连接，但实际 job 执行时如果用 DI 注入了 DbContext，又会开新连接。解决方法：</p>
+    <pre><code class="language-csharp">s.UsePostgres(cs =>
+{
+    cs.ConnectionString = "Host=...;...;Maximum Pool Size=20";
+    cs.TablePrefix = "qrtz_";
+});</code></pre>
+    <p>限制连接池大小并监控 pgbouncer 做连接复用。</p>
+
+    <h2>监控和运维</h2>
+    <p>Quartz.NET 没有 Hangfire 那种内置 Dashboard。我用两个手段做可观测性：</p>
+    <p>一是把 Job 执行记录写入业务数据库的一张 <code>job_execution_log</code> 表：</p>
+    <pre><code class="language-csharp">public class LoggingJobListener : IJobListener
+{
+    public string Name => "LoggingListener";
+
+    public async Task JobWasExecuted(
+        IJobExecutionContext context,
+        JobExecutionException? jobException,
+        CancellationToken ct)
+    {
+        await _dbContext.JobExecutionLogs.AddAsync(new JobExecutionLog
+        {
+            JobName = context.JobDetail.Key.Name,
+            FireTime = context.FireTimeUtc,
+            Duration = context.JobRunTime,
+            Success = jobException == null,
+            Error = jobException?.Message
+        }, ct);
+        await _dbContext.SaveChangesAsync(ct);
+    }
+}</code></pre>
+    <p>二是在 Grafana 上建一张面板，查询 <code>job_execution_log</code> 表，展示各 Job 的最近执行时间、耗时趋势和成功率。</p>
+    <p>告警逻辑：连续两次执行失败 → 飞书通知。执行时间超过历史平均值的 3 倍 → 告警。</p>
+    <p>这套下来，不能说和 Hangfire 的 Dashboard 一样好用，但足够在生产环境定位问题了。</p>
+
+    <h2>集群故障转移实测</h2>
+    <p>做了两轮故障转移测试。第一轮：三节点集群，直接 kill Node A 的进程。大约 20 秒后（misfire threshold + checkin interval 的叠加），Node B 接管了 Node A 上等待触发的 trigger。第二轮：网络分区，Node A ping 不上数据库但进程还在。由于心跳写入失败，A 标记为离线，B 接管。A 恢复后重新注册为新的 scheduler instance，不会造成重复执行。</p>
+    <p>这种基于数据库行锁的集群方案好处是零额外依赖，坏处是心跳间隔不可能太短（数据库的负担），故障转移有 15~30 秒的窗口。对秒级精确调度的场景不够用，但对报表、数据同步这类分钟级以上的任务完全够用。</p>
+
+    <h2>选择建议</h2>
+    <p>如果你的定时任务具备以下特征，Quartz.NET 比 Hangfire 更合适：需要秒级 cron 精度；不想引入 Redis/MQ 等额外基础设施；任务有复杂的调度链路（任务 A 完成触发任务 B）；团队对 SQL 和数据库运维更熟悉。</p>
+    <p>如果你的场景是"HTTP 请求驱动的后台作业"（用户点了按钮后异步处理），那 Hangfire 的 fire-and-forget 模型更自然。Quartz.NET 是纯 cron 驱动的调度器，不是后台作业队列。两者解决的问题有重叠但不一样。</p>
+  </article>
+  <script src="../assets/js/common.js"></script>
+</body>
+</html>
