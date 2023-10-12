@@ -1,6 +1,18 @@
 var POSTS_DATA = 
 [
   {
+    "title": "分布式链路追踪：OpenTelemetry + Jaeger in .NET",
+    "slug": "2023-10-12-opentelemetry-jaeger-dotnet-tracing",
+    "date": "2023-10-12",
+    "tags": [
+      "OpenTelemetry",
+      "Jaeger",
+      "链路追踪",
+      ".NET"
+    ],
+    "summary": "在 .NET 微服务中集成 OpenTelemetry + Jaeger 实现分布式链路追踪和性能分析"
+  },
+  {
     "title": "Quartz.NET 分布式任务调度实战",
     "slug": "2023-06-30-quartznet-distributed-scheduling",
     "date": "2023-06-30",

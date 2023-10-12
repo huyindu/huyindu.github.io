@@ -1,0 +1,148 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>分布式链路追踪：OpenTelemetry + Jaeger in .NET - HoEndo的技术博客</title>
+  <meta name="article-date" content="2023-10-12">
+  <meta name="article-tags" content="OpenTelemetry,Jaeger,链路追踪,.NET">
+  <meta name="description" content="在 .NET 微服务中集成 OpenTelemetry + Jaeger 实现分布式链路追踪和性能分析">
+</head>
+<body>
+  <article class="post-content">
+    <h1>分布式链路追踪：OpenTelemetry + Jaeger in .NET</h1>
+
+    <h2>一个慢请求查了三个小时</h2>
+    <p>那是一个周三下午，客服反馈用户下单接口偶尔超时 8 秒，但大部分时候正常。查日志——Gateway 日志显示调用 Order Service 用了 200 ms，看起来没问题。查 Order Service 日志——处理请求用了 150 ms，也没问题。加一起怎么会有 8 秒？中间那 7.65 秒去哪了？</p>
+    <p>对着 4 个服务的分散日志拼了半天，发现是 Order Service 在扣库存时调 Inventory Service，Inventory Service 又调了一个第三方的仓储 WMS 接口——那个第三方接口偶尔卡 6~7 秒。没有链路追踪的情况下，这链条靠人肉翻日志几乎发现不了。</p>
+    <p>上 OpenTelemetry 之后，同样的问题一眼看出来——Jaeger UI 的 Gantt 图里 WMS 调用的 span 占了整个 trace 90% 的时间，红色高亮。</p>
+
+    <h2>OpenTelemetry .NET 快速接入</h2>
+    <p>2023 年 OTel .NET SDK 已经 GA，1.5 版本的自动埋点覆盖了 ASP.NET Core、EF Core、HttpClient，基本不需要手写 span。集成步骤四步：</p>
+    <p>第一步：NuGet 包。</p>
+    <pre><code class="language-xml">&lt;PackageReference Include="OpenTelemetry.Extensions.Hosting" Version="1.5.0" /&gt;
+&lt;PackageReference Include="OpenTelemetry.Instrumentation.AspNetCore" Version="1.5.0" /&gt;
+&lt;PackageReference Include="OpenTelemetry.Instrumentation.Http" Version="1.5.0" /&gt;
+&lt;PackageReference Include="OpenTelemetry.Instrumentation.EntityFrameworkCore" Version="1.0.0-beta.7" /&gt;
+&lt;PackageReference Include="OpenTelemetry.Exporter.OpenTelemetryProtocol" Version="1.5.0" /&gt;</code></pre>
+    <p>第二步：注册服务。</p>
+    <pre><code class="language-csharp">services.AddOpenTelemetry()
+    .WithTracing(builder => builder
+        .AddAspNetCoreInstrumentation(options =>
+        {
+            options.Filter = ctx => !ctx.Request.Path.StartsWithSegments("/health");
+            options.EnrichWithHttpRequest = (activity, request) =>
+                activity.SetTag("tenant.id", request.Headers["X-Tenant-Id"].FirstOrDefault());
+        })
+        .AddHttpClientInstrumentation(options =>
+        {
+            options.EnrichWithHttpRequestMessage = (activity, request) =>
+                activity.SetTag("service.name", request.RequestUri?.Host);
+        })
+        .AddEntityFrameworkCoreInstrumentation()
+        .AddOtlpExporter(options =>
+        {
+            options.Endpoint = new Uri("http://jaeger-collector:4317");
+            options.Protocol = OtlpExportProtocol.Grpc;
+        }));
+</code></pre>
+    <p><code>AddAspNetCoreInstrumentation</code> 自动为每个 HTTP 请求创建 root span。<code>AddHttpClientInstrumentation</code> 拦截所有 <code>HttpClient</code> 发出的请求，创建子 span 并自动传播 trace context（通过 W3C Trace-Context header）。<code>AddEntityFrameworkCoreInstrumentation</code> 把 EF Core 的数据库查询变成 span，能直接看到哪条 SQL 慢了。</p>
+    <p>第三步：Propagation。跨服务时，trace context 需要在 HTTP header 里传递。OTel SDK 的 <code>HttpClientInstrumentation</code> 自动注入了 <code>traceparent</code> 和 <code>tracestate</code> header。如果服务间用消息队列（RabbitMQ/Kafka）通信，需要手动注入和提取：</p>
+    <pre><code class="language-csharp">// Producer
+var propagator = new TraceContextPropagator();
+var context = new PropagationContext(Activity.Current?.Context ?? default, Baggage.Current);
+propagator.Inject(context, message.Headers, (headers, key, value) =>
+    headers[key] = value);
+
+// Consumer
+var ctx = propagator.Extract(default, message.Headers, (headers, key) =>
+    headers.TryGetValue(key, out var v) ? new[] { v } : Enumerable.Empty&lt;string&gt;());
+
+using var activity = ActivitySourceProvider.Source
+    .StartActivity("ConsumeMessage", ActivityKind.Consumer, ctx.ActivityContext);
+</code></pre>
+
+    <h2>Jaeger 部署</h2>
+    <p>Jaeger 1.45 支持 OTLP gRPC 原生接收，不需要额外转换层。docker-compose：</p>
+    <pre><code class="language-yaml">jaeger:
+  image: jaegertracing/all-in-one:1.45
+  ports:
+    - "16686:16686"   # UI
+    - "4317:4317"     # OTLP gRPC
+    - "4318:4318"     # OTLP HTTP
+  environment:
+    - COLLECTOR_OTLP_ENABLED=true
+    - SPAN_STORAGE_TYPE=badger
+    - BADGER_EPHEMERAL=false
+    - BADGER_DIRECTORY_VALUE=/badger/data
+  volumes:
+    - jaeger-data:/badger/data</code></pre>
+    <p>生产环境建议把 <code>SPAN_STORAGE_TYPE</code> 换成 Elasticsearch 或 Cassandra。测试环境用 Badger（嵌入式 KV 存储）足够，数据量不大的话性能够用。</p>
+
+    <h2>Sampling 策略：不能全采</h2>
+    <p>生产环境 QPS 上去之后，100% 采样会把 Jaeger 打爆。OTel SDK 的默认采样是 <code>AlwaysOn</code>，必须改：</p>
+    <pre><code class="language-csharp">builder.SetSampler(new TraceIdRatioBasedSampler(0.1)); // 10% 采样
+// 或者父 span 决定子 span：
+builder.SetSampler(new ParentBasedSampler(new TraceIdRatioBasedSampler(0.1)));</code></pre>
+    <p><code>ParentBasedSampler</code> 的逻辑：如果父 span 被采样，子 span 一定被采样；如果父 span 没被采样，子 span 也不采。这保证了一个完整 trace 不会被截断。</p>
+    <p>10% 采样率下，大部分慢请求的 trace 不会被采到——这是个问题。我的做法是加一个自定义 sampler，对耗时超过阈值的 span 强制采样：</p>
+    <pre><code class="language-csharp">public class ErrorAndLatencySampler : Sampler
+{
+    private readonly Sampler _base = new TraceIdRatioBasedSampler(0.1);
+
+    public override SamplingResult ShouldSample(in SamplingParameters parameters)
+    {
+        var result = _base.ShouldSample(parameters);
+        // 父 span 已经决定采样时直接沿用
+        if (parameters.ParentContext.IsValid && result.Decision != SamplingDecision.RecordAndSample)
+            return result;
+        // 慢请求或错误请求强制采样
+        var tags = parameters.Tags;
+        if (tags.Any(t => t.Key == "http.status_code" && (int)t.Value >= 500))
+            return new SamplingResult(SamplingDecision.RecordAndSample);
+        return result;
+    }
+}</code></pre>
+    <p>这个定制 sampler 保证错误请求 100% 采样，正常请求按 10%。实际跑下来采样率约 12%，存储压力没有明显增加。</p>
+
+    <h2>实际排查：一个线上问题</h2>
+    <p>上线后没两天就逮到一个问题。用户注册流程偶尔 5 秒超时，trace 显示：</p>
+    <p><code>POST /api/register</code> (5.2 s)<br>
+    → <code>UserService.CreateUser</code> (90 ms)<br>
+    → <code>POST /api/notifications/send-email</code> (5.0 s) ← 这里！<br>
+    → <code>NotificationService.SendEmail</code> (4.9 s)<br>
+    → <code>SMTP connect</code> (4.8 s)</p>
+    <p>SMTP 服务商的连接偶尔超时。问题的根源几秒钟就定位了，解决方案是让通知异步化，不阻塞注册流程。</p>
+    <p>没有 tracing 的话，定位路径是：用户说慢 → 看 Gateway 日志 → 看各服务日志 → 猜可能是通知服务 → 加日志 → 等复现。有了 tracing，一个 trace ID 就串起来了。</p>
+
+    <h2>与日志系统联动</h2>
+    <p>OTel 的 <code>Activity.TraceId</code> 和 <code>Activity.SpanId</code> 注入 NLog 的 MDLC（Mapped Diagnostics Logical Context）后，写进 Loki 的日志里：</p>
+    <pre><code class="language-csharp">// 注册到 NLog MDLC
+services.AddOpenTelemetry()
+    .WithTracing(builder =>
+    {
+        builder.AddAspNetCoreInstrumentation(options =>
+        {
+            options.EnrichWithHttpRequest = (activity, request) =>
+            {
+                activity.SetTag("tenant.id", request.Headers["X-Tenant-Id"]);
+                NLog.MappedDiagnosticsLogicalContext.Set("TraceId", activity.TraceId.ToHexString());
+                NLog.MappedDiagnosticsLogicalContext.Set("SpanId", activity.SpanId.ToHexString());
+            };
+        });
+    });
+</code></pre>
+    <p>NLog 的 JSON layout 里已经配了 <code>traceId</code> 和 <code>spanId</code> 字段（上一篇日志系统的文章里讲过）。这样在 Grafana 里看到一条错误日志，复制 traceId 贴到 Jaeger UI 搜索框，直接跳到对应 trace——反过来，在 Jaeger 里看到异常 span，拿 traceId 去 Grafana 查完整日志。两个系统的联动让排障效率翻了一倍。</p>
+
+    <h2>性能开销</h2>
+    <p>采样率 10% 时，OTel SDK 对每个请求的 CPU 开销约 0.2 ms（创建 Activity 和 span 的分配）。在 QPS 200 的 Order Service 上，开启 tracing 后的 P99 延迟从 145 ms 升到 148 ms，几乎可以忽略。内存方面，Activity 对象的分配被 pooled，GC 压力没有明显增加。</p>
+    <p>Jaeger 的 OTLP 导出是异步批量发送的，不会阻塞请求线程。</p>
+
+    <h2>选型：Jaeger vs Zipkin vs Tempo</h2>
+    <p>我也试过 Zipkin，它的 UI 在复杂 trace 的可视化上比 Jaeger 弱一些，依赖分析功能也不如 Jaeger。Grafana Tempo 的优势在于和 Grafana 原生集成（不需要单独开一个 UI），但 Tempo 在 2023 年还比较新，社区的 .NET 实践不如 Jaeger 多。</p>
+    <p>Jaeger 作为 CNCF 毕业项目，稳定性和生态都经过了足够检验。1.45 版本对 OTLP 的完整支持意味着它不只是 Jaeger 自己的 client 能用，所有支持 OTLP 的语言和框架都能接入。未来换后端（比如切到 Grafana Tempo）不需要改应用代码，只需要改 exporter 的 endpoint。</p>
+    <p>这套方案的生产跑了一个季度后，最大的变化不是为了排障才打开 Jaeger——而是每天上班先看一眼 Jaeger，看看有没有异常 trace。从被动排查变成主动观测，这才是分布式追踪真正的价值。</p>
+  </article>
+  <script src="../assets/js/common.js"></script>
+</body>
+</html>
