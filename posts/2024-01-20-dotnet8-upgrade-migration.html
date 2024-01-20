@@ -1,0 +1,100 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>.NET 8 升级实战：跨版本迁移的坑与收获 - HoEndo的技术博客</title>
+  <meta name="article-date" content="2024-01-20">
+  <meta name="article-tags" content=".NET 8,版本升级,C#,性能优化">
+  <meta name="description" content="将 SaaS 项目从 .NET 3.1 逐级升级到 .NET 8：迁移路径、Breaking Changes 和性能对比">
+</head>
+<body>
+  <article class="post-content">
+    <h1>.NET 8 升级实战：跨版本迁移的坑与收获</h1>
+
+    <h2>起点：一个跑了三年的 .NET 3.1 SaaS 项目</h2>
+
+    <p>我们团队维护的 SaaS 平台最早在 2020 年立项，当时 .NET Core 3.1 是 LTS，理所当然选了它。三年下来，业务模块堆到了二十几个，NuGet 包引了七十多个，数据库跑 SQL Server，部署在 Linux Docker 上。.NET 3.1 在 2022 年 12 月停止支持之后，安全补丁不再更新，合规审计那边已经提了好几次。拖到 2023 年底，.NET 8 LTS 发布，我们决定一次性跨四个大版本升上去。</p>
+
+    <p>说实话，跨版本升级这种事，计划再周密也架不住实际情况复杂。我这边记录整个过程中踩过的坑，以及升级后拿到的实际性能数据。</p>
+
+    <h2>升级路线：跳着升还是逐级升？</h2>
+
+    <p>最开始的想法很直接：改 TargetFramework 从 netcoreapp3.1 到 net8.0，编译，修错，完事。一跑，三千多个编译错误，当场放弃这个路线。</p>
+
+    <p>拆分下来实际可行的路径是：3.1 → 5.0 → 6.0 → 8.0。跳过 .NET 7 是因为它不是 LTS，而我们的目标是在 LTS 上稳定下来。每一步的 Strategy 都一样：更新 TFM、升级所有 NuGet 包到对应版本、修编译错误和警告、跑完整的集成测试。</p>
+
+    <p>3.1 到 5.0 相对顺利，主要是 API 移除的适配。5.0 到 6.0 开始遇到真正的问题——Startup.cs 到 Program.cs 的 Minimal Hosting 模式变化。我们选择暂时保留 Startup 类的写法，因为 6.0 仍然兼容，等到 8.0 再统一迁移。6.0 到 8.0 是最后一步，也是坑最多的一步。</p>
+
+    <h2>第一大坑：System.Drawing 在 Linux 上彻底没了</h2>
+
+    <p>我们的平台有一个发票图片处理模块，调的是 System.Drawing.Common 的 Bitmap 类做缩放和水印。在 .NET 6 的时候，Linux 上跑会抛一个 TypeInitializationException，但设一下 DOTNET_SYSTEM_DRAWING_COMMON_OPTS 环境变量还能凑合用，虽然日志里会打 warning。到了 .NET 8，微软直接把 Linux 上的 GDI+ 支持彻底砍了，任何调用直接 PlatformNotSupportedException。</p>
+
+    <p>这个坑我是周五下午部署测试环境的时候撞上的。图片处理接口直接 500，查日志才发现问题。周末两天基本搭进去了——选型、换库、调接口、回归测试。最终选了 SkiaSharp，这是 Google 维护的跨平台 2D 图形库，API 设计比 System.Drawing 更现代，性能也好一截。迁移成本大概改了 400 行代码，主要是把 Bitmap 替换成 SKBitmap，Graphics 替换成 SKCanvas。</p>
+
+    <p>贴一段对比，原来加水印的代码：</p>
+
+<pre><code class="language-csharp">// 旧代码 - System.Drawing (Linux 上 .NET 8 直接炸)
+using var bitmap = new Bitmap(inputPath);
+using var graphics = Graphics.FromImage(bitmap);
+graphics.DrawString(watermark, font, brush, x, y);
+bitmap.Save(outputPath);</code></pre>
+
+    <p>替换成 SkiaSharp 之后：</p>
+
+<pre><code class="language-csharp">// 新代码 - SkiaSharp
+using var bitmap = SKBitmap.Decode(inputPath);
+using var canvas = new SKCanvas(bitmap);
+canvas.DrawText(watermark, x, y, paint);
+using var image = SKImage.FromBitmap(bitmap);
+using var data = image.Encode(SKEncodedImageFormat.Png, 90);
+using var stream = File.OpenWrite(outputPath);
+data.SaveTo(stream);</code></pre>
+
+    <p>除了 API 差异外，SkiaSharp 还带来一个额外好处：处理 3000×4000 的大图时，内存占用比 System.Drawing 少了约 40%，因为它的内存管理不走 GDI+ 那一套。</p>
+
+    <h2>EF Core 升级：从 3.1 到 8.0 的查询行为变化</h2>
+
+    <p>EF Core 从 3.0 开始引入了客户端评估的严格限制——不能在服务端翻译的 LINQ 表达式直接抛异常。我们从 3.1 升上来的时候已经处理过一波，但 6.0 到 8.0 之间查询翻译器又改了不少行为。</p>
+
+    <p>遇到最头疼的一个问题：EF Core 8.0 的 Contains 查询在参数超过一定数量时会用 OPENJSON 而非传统的 IN 子句。我们的租户过滤逻辑大量用了 Contains，结果 SQL Server 的查询计划全变了，几个高频接口的响应时间从 50ms 飙到 800ms。</p>
+
+    <p>排查过程不复杂，把 EF Core 生成的 SQL 打出来一看就明白了。但修起来需要理解 SQL Server 的查询优化器行为。最终的方案是在 DbContext 里针对那个 DbSet 加了查询拦截器，对参数数量超过阈值的 Contains 手动构造临时表查询。</p>
+
+    <p>另一个 Breaking Change 是 EF Core 8.0 默认使用 DateOnly 和 TimeOnly 映射，我们数据库里用的还是 datetime 列，升级后部分查询的 DateTime 比较逻辑需要显式转换，不然会走客户端评估。这个改起来不复杂，全局搜索替换 DateTime.Date 改成 DateOnly 的构造就行。</p>
+
+    <h2>Native AOT 的诱惑与现实</h2>
+
+    <p>.NET 8 的一大卖点是 Native AOT 的增强支持——ASP.NET Core 应用可以编译成原生二进制，启动速度和内存占用大幅降低。我们第一时间在测试环境试了。</p>
+
+    <p>结果：一个中等规模的 Web API 项目，Native AOT 编译失败。主要原因是大量的第三方库（包括 SkiaSharp、一些老的企业级中间件）内部用了反射，而 Native AOT 对反射的兼容性仍然有限。虽然可以用 rd.xml 声明反射类型，但二十几个模块逐个排查的工作量远超预期。</p>
+
+    <p>最终我们没有在全量服务上开启 Native AOT，只在几个无状态的内部工具服务上做了 AOT 编译。效果确实惊艳：冷启动从 3.2 秒降到 0.4 秒，内存从 120MB 降到 45MB。但代价是编译时间从 30 秒变成了 8 分钟。对于生产环境的核心服务，我们选择继续用 JIT 模式，配合 ReadyToRun 编译拿到折中的启动性能提升。</p>
+
+    <h2>性能数据：升级前后的对比</h2>
+
+    <p>升级完成后，在相同的 4C8G 容器配置下跑了压测对比：</p>
+
+    <p>API 吞吐量（RPS）：.NET 3.1 上跑 4200，.NET 8 上跑 6100。提升约 45%。这里面有 runtime 本身的优化，也有我们顺便重构了部分热路径代码的功劳。</p>
+
+    <p>内存占用：稳定运行 24 小时后，.NET 3.1 的工作集在 980MB 左右，.NET 8 降到 620MB。GC 的改进确实明显，Server GC 在 8.0 里的 Region 分配策略减少了碎片。</p>
+
+    <p>P95 延迟：从 180ms 降到 95ms。这部分提升主要来自 Kestrel 在 .NET 8 里的 HTTP/3 支持和连接管理优化。</p>
+
+    <p>一个意外的收获是 JSON 序列化。我们之前用的 Newtonsoft.Json，升级时换成了 System.Text.Json，序列化性能提升了 3 倍，反序列化提升了 2.5 倍。接口响应体大的场景下这个差别很明显。</p>
+
+    <h2>升级过程中的几个实操建议</h2>
+
+    <p>第一，不要直接改 TFM 一把梭。每个大版本之间至少留一天的时间来修编译错误和跑测试。我们的经验是 3.1→5.0 用了一天，5.0→6.0 用了两天，6.0→8.0 用了一周。</p>
+
+    <p>第二，升级前先把所有 NuGet 包的兼容性理一遍。我们用 dotnet list package --outdated --include-prerelease 生成了一份清单，手动标注每个包的 .NET 8 支持状态。有几个关键包需要升到 Preview 版本才能跑在 .NET 8 上，这在 LTS 刚发布的头两个月很常见。</p>
+
+    <p>第三，别在生产环境直接切，先用灰度流量验证。我们把升级后的镜像推到 staging，用生产流量镜像跑了三天，确认没有异常后才全量切。</p>
+
+    <p>第四，System.Drawing 的问题不是 .NET 8 独有的——从 .NET 6 开始微软就在逐步弃用它。如果你的项目有图像处理需求，尽早迁移到 SkiaSharp 或 ImageSharp，别等到升不上去的时候手忙脚乱。</p>
+
+    <p>.NET 8 的整体体验很好，升级虽然折腾了两周，但性能和可维护性的提升是实打实的。LTS 的三年支持周期也给了我们足够的安全感。</p>
+  </article>
+  <script src="../assets/js/common.js"></script>
+</body>
+</html>

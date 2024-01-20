@@ -1,6 +1,18 @@
 var POSTS_DATA = 
 [
   {
+    "title": ".NET 8 升级实战：跨版本迁移的坑与收获",
+    "slug": "2024-01-20-dotnet8-upgrade-migration",
+    "date": "2024-01-20",
+    "tags": [
+      ".NET 8",
+      "版本升级",
+      "C#",
+      "性能优化"
+    ],
+    "summary": "将 SaaS 项目从 .NET 3.1 逐级升级到 .NET 8：迁移路径、Breaking Changes 和性能对比"
+  },
+  {
     "title": "分布式链路追踪：OpenTelemetry + Jaeger in .NET",
     "slug": "2023-10-12-opentelemetry-jaeger-dotnet-tracing",
     "date": "2023-10-12",
