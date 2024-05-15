@@ -1,6 +1,18 @@
 var POSTS_DATA = 
 [
   {
+    "title": "大数据分析在 .NET 中的实践",
+    "slug": "2024-05-15-big-data-analysis-dotnet",
+    "date": "2024-05-15",
+    "tags": [
+      "大数据",
+      ".NET",
+      "ETL",
+      "数据分析"
+    ],
+    "summary": "在 .NET 生态中构建 ETL 管道，处理 SaaS 平台的海量业务数据分析需求"
+  },
+  {
     "title": ".NET 8 升级实战：跨版本迁移的坑与收获",
     "slug": "2024-01-20-dotnet8-upgrade-migration",
     "date": "2024-01-20",

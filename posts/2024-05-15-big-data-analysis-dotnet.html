@@ -1,0 +1,140 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>大数据分析在 .NET 中的实践 - HoEndo的技术博客</title>
+  <meta name="article-date" content="2024-05-15">
+  <meta name="article-tags" content="大数据,.NET,ETL,数据分析">
+  <meta name="description" content="在 .NET 生态中构建 ETL 管道，处理 SaaS 平台的海量业务数据分析需求">
+</head>
+<body>
+  <article class="post-content">
+    <h1>大数据分析在 .NET 中的实践</h1>
+
+    <h2>SQL 跑不动了</h2>
+
+    <p>SaaS 平台跑了几年以后，几个核心业务表的数据量开始让报表接口吃不消了。订单表接近两亿行，用户行为日志每天新增几百万条，财务对账需要跨十张表做聚合。SQL Server 上跑一个月度报表查询，动辄四五十秒，高峰期直接拖慢整个数据库。</p>
+
+    <p>加索引、做分区、上读写分离——这些常规手段都用过了，效果越来越有限。需求侧还在加：运营要实时看板、客户要做同比环比、管理层要导出 Excel。我开始认真考虑把分析负载从 OLTP 数据库里拆出来。</p>
+
+    <p>数据团队大部分同事用 Python，Airflow + Spark 是标配。但我们的后端全栈 .NET，如果引入 Python 技术栈，维护成本、部署复杂度、团队技能树都要跟着变。我决定先在 .NET 生态里探索一下 ETL 管道的可行性。</p>
+
+    <h2>流式 ETL：PLINQ + Channel 的组合意外好用</h2>
+
+    <p>第一个场景是用户行为日志的清洗和聚合。日志原始数据存在 SQL Server 里，每天凌晨需要跑一轮 ETL 把明细聚合成小时级和日级的统计表。原来的做法是一条 SQL 跑到底：INSERT INTO ... SELECT ... GROUP BY ...。数据量小的时候没问题，到了千万级别，这条 SQL 锁表时间越来越长，有一次直接把订单表的写入卡住了三分钟。</p>
+
+    <p>我的思路是把聚合逻辑从数据库搬到应用层，用流式处理的方式分批读取、分批计算、分批写入，全程不锁源表。.NET 里的 System.Threading.Channels 正好适合做生产者-消费者管道。</p>
+
+    <p>管道设计：一个 Producer 从 SQL Server 分批 SELECT（每批 5000 行，走 READ UNCOMMITTED 隔离级别），写入 Channel。三个并行的 Consumer 从 Channel 读取，做清洗（去重、补全缺失字段、异常值过滤）和预聚合（先按小时做局部汇总），结果写入另一个 Channel。最后由一个 Aggregator 把局部汇总合并成最终统计，批量 INSERT 到结果表。</p>
+
+    <p>核心代码大概长这样：</p>
+
+<pre><code class="language-csharp">var sourceChannel = Channel.CreateBounded&lt;LogBatch&gt;(new BoundedChannelOptions(100)
+{
+    FullMode = BoundedChannelFullMode.Wait
+});
+
+var aggregatedChannel = Channel.CreateBounded&lt;HourlyStat&gt;(new BoundedChannelOptions(200)
+{
+    FullMode = BoundedChannelFullMode.Wait
+});
+
+// Producer: 分批读取
+var producer = Task.Run(async () =>
+{
+    await foreach (var batch in ReadLogsInBatches(5000))
+    {
+        await sourceChannel.Writer.WriteAsync(batch);
+    }
+    sourceChannel.Writer.Complete();
+});
+
+// Consumers: 并行清洗和预聚合
+var consumers = Enumerable.Range(0, 3).Select(_ => Task.Run(async () =>
+{
+    await foreach (var batch in sourceChannel.Reader.ReadAllAsync())
+    {
+        var cleaned = CleanAndValidate(batch);
+        var partialAgg = cleaned
+            .AsParallel()
+            .GroupBy(l => new { l.TenantId, l.EventType, Hour = l.Timestamp.Hour })
+            .Select(g => new HourlyStat { /* ... */ });
+
+        foreach (var stat in partialAgg)
+        {
+            await aggregatedChannel.Writer.WriteAsync(stat);
+        }
+    }
+}));
+
+// 等 consumers 完成后关闭输出 channel
+await Task.WhenAll(consumers);
+aggregatedChannel.Writer.Complete();</code></pre>
+
+    <p>PLINQ 在预聚合阶段发挥了作用。每个 Consumer 拿到的 5000 行数据，用 AsParallel() 做分组聚合，四核机器上速度差不多是单线程的三倍。Channel 的背压机制保证了内存不会暴涨——当消费者处理不过来的时候，生产者端的 WriteAsync 会自动等待。</p>
+
+    <p>这个管道跑在凌晨的定时任务里，处理 800 万条日志从原来的 12 分钟（纯 SQL）降到了 4 分钟，而且完全不锁源表。</p>
+
+    <h2>Parquet 格式：存储和查询的双赢</h2>
+
+    <p>日志明细数据有一个需求是运营要按条件导出 CSV，有时候导出几十万行，Excel 都打不开。我开始研究列式存储，Apache Parquet 在数据科学领域是标准格式，.NET 这边有 Parquet.NET 库可用。</p>
+
+    <p>把 CSV 换成 Parquet 有三个明显好处。第一是存储空间——同样的数据，Parquet 文件大小约为 CSV 的 1/5 到 1/10，因为列式压缩效果好。第二是查询速度——列式存储在做聚合的时候只读需要的列，IO 量大幅减少。第三是兼容性——Python 那边的数据团队可以直接用 Pandas 读，不用我再导一份。</p>
+
+    <p>用 Parquet.NET 写文件很简单：</p>
+
+<pre><code class="language-csharp">using var fileStream = File.OpenWrite("logs_202405.parquet");
+using var writer = await ParquetWriter.CreateAsync(
+    schema,
+    fileStream,
+    new ParquetOptions { CompressionMethod = CompressionMethod.Snappy });
+
+using var groupWriter = writer.CreateRowGroup();
+
+await groupWriter.WriteColumnAsync(
+    new DataColumn(schema.DataFields[0], tenantIds));
+await groupWriter.WriteColumnAsync(
+    new DataColumn(schema.DataFields[1], timestamps));
+// ... 其余列</code></pre>
+
+    <p>读的时候配合 Predicate Pushdown，可以在文件层面就过滤掉不相关的 Row Group。比如运营只看某个租户的数据，Parquet.NET 可以跳过不包含该租户 ID 的整个 Row Group，IO 大幅减少。</p>
+
+    <h2>Microsoft.Data.Analysis 的 DataFrame：够用但不成熟</h2>
+
+    <p>微软在 2020 年发布了 Microsoft.Data.Analysis，想给 .NET 生态补上 DataFrame 这环。我在做同比环比计算的时候试了试，体验是："能用，但还差不少"。</p>
+
+    <p>API 设计和 Python 的 Pandas 很像，上手不难。基本的 Filter、GroupBy、Join 都有。但问题出在细节上：Sort 操作会复制整个 DataFrame 而非原地排序，十万行级别的数据就感觉到明显延迟。Merge 操作不支持 left/right indicator，做数据对比的时候需要自己加标记列。文档也比较稀疏，很多场景要靠看源码来理解行为。</p>
+
+    <p>另外生态是个大问题。Python 那边 Pandas 有海量的社区方案，各种时间序列分析、统计检验开箱即用。.NET 这边 DataFrame 的数据源连接器很有限——读 CSV 和 Parquet 没问题，但直接读 SQL Server 或者 Redis 就不支持了，需要自己写 Adapter。</p>
+
+    <p>我最终的方案是：数据清洗和预处理留在 .NET 管道里用 PLINQ + Channel 完成，复杂的数据分析（比如 ARIMA 时间序列预测）导出 Parquet 给 Python 团队用。两个技术栈各做各擅长的事，协作起来反而顺畅。</p>
+
+    <h2>Deedle：.NET 里的另一个选项</h2>
+
+    <p>Deedle 是 F# 社区搞的数据分析库，比 Microsoft.Data.Analysis 更早，API 也更偏函数式。它最大的优点是时间序列处理很强，Frame 和 Series 的概念和 Pandas 一一对应。做滑动窗口计算、缺失值填充这些操作比手写循环干净很多。</p>
+
+    <p>我用 Deedle 做了 SaaS 平台的租户健康度评分——基于过去 90 天的登录活跃度、功能使用率、工单数量三个指标，加权计算一个健康分。时间序列的滑动窗口和加权平均在 Deedle 里用几行就搞定：</p>
+
+<pre><code class="language-csharp">var healthSeries = loginSeries
+    .Window(30)          // 30 天滑动窗口
+    .Select(window => window.Mean())
+    .FillMissing(Direction.Forward);
+
+var weightedScore = healthSeries * 0.4
+    + featureSeries * 0.35
+    + ticketSeries * 0.25;</code></pre>
+
+    <p>Deedle 的问题在于它是纯 .NET 实现，没有利用任何原生加速，数据量大（百万行以上）的时候比 Pandas 慢不少。而且在 C# 里用 Deedle 的 F# 风格 API 总觉得有点拗口。</p>
+
+    <h2>整体架构与教训</h2>
+
+    <p>折腾了大半年，我们现在的数据处理架构分了三层：实时层用 Channel 管道做流式处理，处理延迟要求分钟级的指标；批处理层用 PLINQ + Parquet 做 T+1 的日报和月报，解耦 OLTP 数据库；深度分析层导出数据给 Python 团队继续处理。</p>
+
+    <p>最大的教训是：不要试图用一个语言或框架包揽一切。.NET 在流式 ETL 和工程化方面很强，编译型语言的优势在高并发管道里能充分体现。但到了需要复杂统计方法、大量第三方算法库的场景，Python 的生态优势是无法忽视的。认清边界，把每个工具用在它最擅长的地方，比硬刚划算得多。</p>
+
+    <p>另一点：大数据这个词容易让人一上来就想着 Spark、Hadoop。但一个 SaaS 平台的数据量绝大多数情况下根本到不了那个级别。先用简单方案跑起来，SQL 跑不动了才上 ETL 管道，ETL 管道不够了再考虑分布式。过度设计在数据处理领域特别容易浪费大量时间。</p>
+  </article>
+  <script src="../assets/js/common.js"></script>
+</body>
+</html>
