@@ -1,6 +1,18 @@
 var POSTS_DATA = 
 [
   {
+    "title": "容器化 SaaS 平台的灰度发布策略",
+    "slug": "2024-08-28-canary-release-k3s-saas",
+    "date": "2024-08-28",
+    "tags": [
+      "灰度发布",
+      "k3s",
+      "SaaS",
+      "DevOps"
+    ],
+    "summary": "在 k3s 上实现 SaaS 平台的灰度发布和金丝雀测试，结合流量切换和自动回滚"
+  },
+  {
     "title": "大数据分析在 .NET 中的实践",
     "slug": "2024-05-15-big-data-analysis-dotnet",
     "date": "2024-05-15",

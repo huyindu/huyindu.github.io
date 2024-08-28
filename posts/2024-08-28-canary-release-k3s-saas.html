@@ -1,0 +1,146 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>容器化 SaaS 平台的灰度发布策略 - HoEndo的技术博客</title>
+  <meta name="article-date" content="2024-08-28">
+  <meta name="article-tags" content="灰度发布,k3s,SaaS,DevOps">
+  <meta name="description" content="在 k3s 上实现 SaaS 平台的灰度发布和金丝雀测试，结合流量切换和自动回滚">
+</head>
+<body>
+  <article class="post-content">
+    <h1>容器化 SaaS 平台的灰度发布策略</h1>
+
+    <h2>一次全量发布的教训</h2>
+
+    <p>去年有一次发布，让我至今印象深刻。周五下午四点，我们照常把新版本推到 k3s 集群。五分钟内，客服电话被打爆了——一个新加的租户隔离逻辑在某条边界条件下会拦截所有付费租户的 API 请求。问题是这个 Bug 只在特定的数据规模下才触发，测试环境的几千条数据根本测不出来。</p>
+
+    <p>那次之后，我们团队花了将近一个月的时间把全量发布改成了灰度发布。现在回头看，这个投入非常值。</p>
+
+    <h2>为什么选 Argo Rollouts + k3s</h2>
+
+    <p>我们的 SaaS 平台跑在自建的 k3s 集群上——三台物理机做控制平面和工作节点混合部署。k3s 自带 Traefik 做 Ingress Controller，省去了额外部署反向代理的工作。灰度发布选型的时候对比过几个方案：</p>
+
+    <p>Flagger 是 Weaveworks 出的，和 Prometheus 集成很深，做指标驱动的自动金丝雀分析很强。但我们的监控栈还没上 Prometheus，如果为了灰度发布去搭一套监控，前期投入太大。</p>
+
+    <p>自己写一个灰度控制器，用 k3s API 动态调整 Deployment 副本数和 Service 的权重——方案可行，但需要处理状态管理、回滚逻辑、超时检测这些边界情况，代码量和维护成本都不低。</p>
+
+    <p>最后选了 Argo Rollouts，原因很简单：它是 Kubernetes 原生的 CRD 方案，和 Argo CD 配合可以实现完整的 GitOps 流程；支持基于 Istio/NGINX/Traefik 的流量分割；分析模板可以自定义；社区活跃，k3s 上跑没有任何兼容问题。</p>
+
+    <h2>在 k3s 上部署 Argo Rollouts</h2>
+
+    <p>Argo Rollouts 的安装就是一个 kubectl apply：</p>
+
+<pre><code class="language-bash">kubectl create namespace argo-rollouts
+kubectl apply -n argo-rollouts \
+  -f https://github.com/argoproj/argo-rollouts/releases/latest/download/install.yaml</code></pre>
+
+    <p>但之后的配置才是重点。k3s 自带的 Traefik 默认是 v2，需要配置 TraefikService 来实现流量分割，而不是用标准的 Kubernetes Service。具体做法：</p>
+
+    <p>创建一个 TraefikService 类型的 CRD 资源，里面定义 weighted 路由策略，stable 和 canary 两个后端各自对应不同的 Service：</p>
+
+<pre><code class="language-yaml">apiVersion: traefik.containo.us/v1alpha1
+kind: TraefikService
+metadata:
+  name: api-weighted
+spec:
+  weighted:
+    services:
+      - name: api-stable
+        port: 80
+        weight: 90
+      - name: api-canary
+        port: 80
+        weight: 10</code></pre>
+
+    <p>IngressRoute 指向这个 TraefikService 而不是直接指向后端 Service。Argo Rollouts 通过修改 TraefikService 的 weight 字段来调整金丝雀流量比例。</p>
+
+    <p>我踩过的一个坑：k3s 的 Traefik 插件默认没有启用 TraefikService CRD 支持，需要在 k3s 的启动配置里加 --kubelet-arg=--enable-crd-provider=traefik。当时卡了半天才发现是这个问题。</p>
+
+    <h2>Rollout 资源的配置细节</h2>
+
+    <p>把 Deployment 替换为 Rollout 资源，配置看起来像这样：</p>
+
+<pre><code class="language-yaml">apiVersion: argoproj.io/v1alpha1
+kind: Rollout
+metadata:
+  name: saas-api
+spec:
+  replicas: 6
+  strategy:
+    canary:
+      steps:
+        - setWeight: 5
+        - pause: { duration: 10m }
+        - setWeight: 20
+        - pause: { duration: 30m }
+        - setWeight: 50
+        - pause: { duration: 30m }
+        - setWeight: 100
+      trafficRouting:
+        traefik:
+          weightedTraefikServiceName: api-weighted
+      analysis:
+        templates:
+          - templateName: error-rate-check
+        startingStep: 1
+  template:
+    # Pod 模板和原来的 Deployment 一样
+</code></pre>
+
+    <p>这套配置的含义：先给 canary 版本 5% 的流量，跑 10 分钟观察；没问题提到 20%，再观察半小时；然后 50%，最后全量。每个阶段之间都挂自动分析，一旦 error-rate-check 模板检测到金丝雀版本的错误率超过阈值，自动回滚。</p>
+
+    <h2>分析模板：不只是看错误率</h2>
+
+    <p>灰度发布最怕的是"看起来正常实际上挂了"。HTTP 200 不能说明一切——我们关注三个维度的指标：</p>
+
+    <p>第一是错误率。用 AnalysisRun 定期查询金丝雀 Pod 的日志，统计 5xx 错误比例。这需要给应用加上结构化日志（我们用的 Serilog），然后 AnalysisRun 的 web metric provider 去查 Loki 的日志聚合结果：</p>
+
+<pre><code class="language-yaml">apiVersion: argoproj.io/v1alpha1
+kind: AnalysisTemplate
+metadata:
+  name: error-rate-check
+spec:
+  metrics:
+    - name: error-rate
+      interval: 2m
+      count: 5
+      successCondition: result &lt; 0.01
+      provider:
+        web:
+          url: "http://loki:3100/loki/api/v1/query?query=..."
+          jsonPath: "{.data.result[0].value[1]}"
+</code></pre>
+
+    <p>第二是响应时间。金丝雀版本的 P95 延迟跟 stable 版本对比，如果劣化超过 30%，终止发布。这个我们通过 Prometheus histogram 指标来实现（灰度项目推动了我们终于上了 Prometheus，算是副产品收获）。</p>
+
+    <p>第三是业务指标——我们特别关注租户登录成功率和核心 API 的调用量。这两个指标不看日志，而是从应用内部暴露的 metrics endpoint 取。一旦金丝雀版本的核心 API 调用量骤降（说明有租户的功能被新版本破坏了），立刻触发回滚。</p>
+
+    <h2>租户粒度的灰度策略</h2>
+
+    <p>SaaS 场景下，随机分配 5% 流量做灰度是不够的。我们做的是租户级别的灰度和金丝雀部署：先选 2 个内部测试租户，再选 5 个低风险的外部租户，最后是高风险大客户租户。</p>
+
+    <p>实现方式是在 Traefik 层加了一个中间件，根据请求的 JWT Token 中携带的 TenantId 做路由判断。金丝雀版本的 Pod 会在启动时加载一个配置，声明自己接收哪些租户的请求。Traefik 中间件读取这个配置，将匹配的租户流量导到 canary Service。</p>
+
+    <p>这个方案的一个细节是：同一个租户的请求在灰度期间必须始终路由到同一个版本。不能让用户刷新一下页面就跑到不同版本的代码上。我们用 Traefik 的 sticky session（基于 cookie）确保这一点。</p>
+
+    <h2>自动回滚的可靠性</h2>
+
+    <p>灰度发布最有价值的其实是回滚能力。全量发布一旦出问题，回滚需要等新 Pod 全部替换回旧版本，这个过程本身就可能几分钟。灰度期间出问题只影响小部分流量，而且 Argo Rollouts 的 rollback 是秒级的——它只需要把 weight 调回 0。</p>
+
+    <p>我们配置了两层保护：分析模板的自动回滚（指标触发）和人工的 kubectl argo rollouts undo 命令。自动回滚会留一个 Aborted 状态的 Rollout 记录，方便事后追溯。</p>
+
+    <p>我推荐在分析模板里把 successCondition 写保守一些。宁可误触发回滚多花几分钟排查，也别让有问题的版本扩散到更多用户。</p>
+
+    <h2>从每月一次到每周三次</h2>
+
+    <p>灰度发布稳定运行三个月后，最大的变化不是技术层面的，而是团队信心。以前每次发布都紧张兮兮，周五不敢发版，运维群全程盯着。现在可以放心地在工作日任何时候触发金丝雀部署，有问题自动回滚，稳定了再全量。</p>
+
+    <p>发布频率从每个月一个大版本变成了每周两三次小版本。迭代速度的提升对 SaaS 产品的价值远超灰度发布本身的技术投入。</p>
+
+    <p>如果你正在考虑给自己的 k3s 集群加灰度发布，我的建议是：不要一上来就追求完美的多阶段分析 + 全自动决策。先实现最简单的两步金丝雀（5% + 手动确认 + 100%），跑通整个链路，再逐步加分析模板和自动回滚。基础设施类的改进，渐进式推进比一次性做完的成功率高很多。</p>
+  </article>
+  <script src="../assets/js/common.js"></script>
+</body>
+</html>
