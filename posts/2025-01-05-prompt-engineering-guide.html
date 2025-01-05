@@ -1,0 +1,117 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Prompt Engineering 实战：从模板到结构化输出 - HoEndo的技术博客</title>
+  <meta name="article-date" content="2025-01-05">
+  <meta name="article-tags" content="Prompt Engineering,提示词工程,LLM,AI 编程">
+  <meta name="description" content="系统总结提示词工程实践：Few-shot、Chain-of-Thought、结构化输出和模板化设计">
+</head>
+<body>
+  <article class="post-content">
+    <h1>Prompt Engineering 实战：从模板到结构化输出</h1>
+
+    <h2>随便写 Prompt 的尴尬期</h2>
+
+    <p>2024 年初我开始在日常开发里频繁用 LLM。写 SQL、生成单元测试、重构代码——效果时好时坏。同一个问题，有时候 GPT-4 给出的代码质量很高，有时候又胡编乱造。开始我以为是模型抽风，后来逐渐意识到是我自己的 Prompt 太随意了。</p>
+
+    <p>举一个真事：我需要从一段 C# 代码里提取所有方法签名和注释。第一次 Prompt 是："把这段代码里的方法列出来"。结果它把属性、事件、委托全列出来了，还编造了不存在的注释。调整后 Prompt 是："提取以下 C# 代码中所有 public 方法的签名、参数类型和 XML 文档注释，以 JSON 格式返回，不要包含属性、字段和事件"。同样的模型，输出准确率从 60% 跳到了接近 100%。</p>
+
+    <p>这次经历促使我系统性地整理了 Prompt 设计的经验。大半年下来，这些方法在我的日常工作里已经成了肌肉记忆。</p>
+
+    <h2>提示词设计的四个有效技巧</h2>
+
+    <h3>角色设定：管用但不是万能药</h3>
+
+    <p>"You are an expert Python developer with 10 years of experience"——这是最常见的 Prompt 开头。实际测试下来，角色设定对代码生成类任务确实有帮助，尤其是指定"资深"身份后模型倾向于用更 idiomatic 的写法。但对推理和分析类任务，角色设定的提升不明显，甚至有时会引入角色的刻板偏见。</p>
+
+    <p>我用过的有效角色设定通常满足三个条件：角色和任务高度匹配、限定在具体领域而非泛泛的"专家"、配合输出格式的明确要求。比如"你是一个审查 C# 内存分配模式的性能工程师，检查以下代码中的不必要的堆分配，按严重程度排序列出"，比"你是一个资深程序员，优化这段代码"效果好得多。</p>
+
+    <h3>Few-shot：给模型看"好答案"长什么样</h3>
+
+    <p>Few-shot 是我用得最多的技巧，投入产出比最高。核心思路是在 Prompt 里提供 2-5 个输入-输出示例，让模型通过模式匹配理解任务期望。</p>
+
+    <p>我用过的一个场景：把非结构化的客户反馈文本分类到预定义的工单类型。没有示例时，模型会把"登录太慢了"归为"性能问题"（太宽泛），给了三个示例后就能准确归类到"登录模块-性能反馈"。关键是示例要覆盖边界情况——如果三个示例都是标准化的完美输入，模型遇到真实世界的脏数据就容易出错。</p>
+
+    <p>Few-shot 的成本是 Token 消耗。我的取舍标准：如果你的输入高度多样化、边界条件多，Few-shot 值得花 Token；如果任务比较标准化、有明确的格式约束，用 Zero-shot + 详细指令就够了。</p>
+
+    <h3>Chain-of-Thought：让模型"展示计算过程"</h3>
+
+    <p>CoT 的原理不复杂——让模型在给出最终答案前先输出推理步骤。但用起来有讲究。不是所有任务都需要 CoT。数学计算、逻辑推理、多步分析这些任务加 CoT 效果显著。简单的分类或者格式转换任务加 CoT 反而浪费 Token 和时间。</p>
+
+    <p>我实践的 CoT 有两种用法。一种是显式的："在给出最终答案之前，先列出你的分析步骤"。另一种是隐式的，通过 Few-shot 示例让模型自然模仿分步推理的风格。我自己更倾向隐式 CoT，因为显式指令有时候会被模型"跳过"（尤其是较小的模型）。</p>
+
+    <p>一个实际案例：分析租户流失风险。有 CoT 的 Prompt 让模型先分析最近活动频率、再看工单历史、然后评估产品使用深度、最后给出流失概率——中间推理过程能看到权重分配的逻辑，排查问题时非常有用。没有 CoT 时模型直接给一个概率数字，你完全不知道它是怎么算出来的。</p>
+
+    <h3>结构化输出：OpenAI Structured Outputs 和它的替代方案</h3>
+
+    <p>2024 年 8 月 OpenAI 发布了 Structured Outputs，让 GPT-4o 和 GPT-4o-mini 可以严格遵照 JSON Schema 输出。这解决了之前靠 Prompt 约束输出格式时偶尔 JSON 解析失败的问题。</p>
+
+    <p>基本用法：</p>
+
+<pre><code class="language-python">from openai import OpenAI
+from pydantic import BaseModel
+
+class MethodInfo(BaseModel):
+    name: str
+    return_type: str
+    parameters: list[dict]
+    summary: str
+
+completion = client.beta.chat.completions.parse(
+    model="gpt-4o",
+    messages=[{"role": "user", "content": prompt}],
+    response_format=MethodInfo
+)
+method_info = completion.choices[0].message.parsed</code></pre>
+
+    <p>但在实际项目里，我们不止用 OpenAI 的模型。Claude 3.5 Sonnet 在代码分析任务上经常比 GPT-4o 更好，DeepSeek V2.5 在成本敏感的场景下是性价比之王。它们都不原生支持 Structured Outputs（至少到 2025 年初是这样），需要用别的方案保证输出格式。</p>
+
+    <p>我用了两个替代方案。第一个是 instructor 库——它封装了多个 LLM 的 API，通过 retry + validation 机制实现跨模型的结构化输出。原理不复杂：在 Prompt 里注入 JSON Schema 指令，解析响应，如果校验失败就自动重试并把错误信息注入下一次请求。实际成功率在 GPT-4 级别模型上约 95%，Claude 上约 90%，小模型上掉到 70% 左右。</p>
+
+    <p>第二个方案更轻量，适合简单的标签提取：在 Prompt 末尾强制加上输出格式示例，然后用正则做后处理提取。虽然没那么"正规"，但在不需要复杂嵌套结构的场景下足够用。</p>
+
+    <h2>模板化：把 Prompt 当成代码管理</h2>
+
+    <p>写了一段时间后发现，重复的 Prompt 模式越来越多。每次做代码审查都用类似的开场白，每次生成 API 文档都有相同的格式要求。我开始把这些 Prompt 用 Jinja2 模板管理起来。</p>
+
+    <p>模板的长相大概是：</p>
+
+<pre><code class="language-jinja2">你是 {{ role }}。
+任务：{{ task_description }}
+{% if examples %}
+参考以下示例：
+{% for ex in examples %}
+输入：{{ ex.input }}
+输出：{{ ex.output }}
+{% endfor %}
+{% endif %}
+输出要求：{{ output_format }}
+禁止事项：{{ constraints | join('、') }}</code></pre>
+
+    <p>模板化的好处是：修改一次模板，所有调用方都能吃到改进。比如发现给模型加一条"禁止使用过时的 API"的约束能减少幻觉，改一次模板就行。另一个好处是 A/B 测试——用不同版本的模板（不同的 Few-shot 示例、不同的输出格式）对比效果，看哪个版本的回答更准确。</p>
+
+    <h2>不同模型的脾气</h2>
+
+    <p>过去一年深度用了 GPT-4o、Claude 3.5 Sonnet 和 DeepSeek V2.5，它们对 Prompt 的响应模式差别还挺大。</p>
+
+    <p>GPT-4o 是指令遵循能力最强的，你写什么它做什么。Structured Outputs 加持下格式化输出的可靠性最高。但创意类任务有时过于保守，答案的四平八稳。</p>
+
+    <p>Claude 3.5 Sonnet 在代码理解和重构上经常给出更优雅的方案。它也更"主动"——有时候会补充你没问但相关的信息。这是优点也是缺点，因为偶尔会偏离你设定的输出格式。所以用 Sonnet 时我习惯在 Prompt 里把输出格式强调两遍。</p>
+
+    <p>DeepSeek V2.5 最大的优势是成本。API 价格大概是 GPT-4o 的 1/10。在批量处理场景（比如对全量客户反馈做分类）很有竞争力。但推理深度不如前两个，复杂的多步逻辑任务建议还是用 GPT 或 Claude。</p>
+
+    <p>一个发现：中文 Prompt 和英文 Prompt 的效果差距在 2024 年后已经很小了。早期模型对中文指令的理解确实不如英文，但 GPT-4o 和 Claude 3.5 系列的中文支持已经很成熟。我现在的习惯是用和代码同样的语言写 Prompt——分析中文文档用中文 Prompt，写代码用英文 Prompt。</p>
+
+    <h2>从"写 Prompt"到"设计交互"</h2>
+
+    <p>搞了大半年提示词工程，最大的认知变化是：Prompt 不是一次性写完就完事的。它是一个迭代过程——写好 → 测试 → 看输出 → 调整 → 再测试。和写代码没什么两样。</p>
+
+    <p>我开始给每个重要 Prompt 建一个测试集——准备 20-30 个真实输入，每次改 Prompt 后跑一遍，检查：输出格式是否合规、关键信息是否遗漏、有没有幻觉内容、Token 消耗是否合理。这个习惯来自写单元测试的经验，换到 Prompt Engineering 场景同样有效。</p>
+
+    <p>提示词工程这个名字容易让人以为就是遣词造句的技巧。实际上它更像产品设计——你要定义清楚输入和输出的契约，处理边界情况，给用户（在这里是模型）足够但不过量的上下文，还要有出错兜底机制。这些思路，和设计一个 API 接口没什么两样。</p>
+  </article>
+  <script src="../assets/js/common.js"></script>
+</body>
+</html>

@@ -1,6 +1,18 @@
 var POSTS_DATA = 
 [
   {
+    "title": "Prompt Engineering 实战：从模板到结构化输出",
+    "slug": "2025-01-05-prompt-engineering-guide",
+    "date": "2025-01-05",
+    "tags": [
+      "Prompt Engineering",
+      "提示词工程",
+      "LLM",
+      "AI 编程"
+    ],
+    "summary": "系统总结提示词工程实践：Few-shot、Chain-of-Thought、结构化输出和模板化设计"
+  },
+  {
     "title": "容器化 SaaS 平台的灰度发布策略",
     "slug": "2024-08-28-canary-release-k3s-saas",
     "date": "2024-08-28",
