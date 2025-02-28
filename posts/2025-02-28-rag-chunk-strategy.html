@@ -1,0 +1,122 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>RAG 检索增强生成：从原理到 Chunk 策略 - HoEndo的技术博客</title>
+  <meta name="article-date" content="2025-02-28">
+  <meta name="article-tags" content="RAG,检索增强生成,向量数据库,Chunk">
+  <meta name="description" content="深入 RAG 的检索和生成两阶段，对比不同文档切片和召回策略的效果差异">
+</head>
+<body>
+  <article class="post-content">
+    <h1>RAG 检索增强生成：从原理到 Chunk 策略</h1>
+
+    <h2>知识库问答的第一版：能跑但不好用</h2>
+
+    <p>去年下半年，运营团队提了一个需求：给 SaaS 平台做一个智能客服，让客户可以直接用自然语言问产品使用问题，从我们的帮助文档里找答案。典型的 RAG 场景——检索增强生成，把文档向量化存起来，用户提问时检索最相关的文档片段喂给 LLM，让它根据参考材料生成回答。</p>
+
+    <p>第一版花了两周就上线了：把 300 多篇帮助文档按 1000 字符固定切块，用 text-embedding-3-small 做向量化，存到 ChromaDB，提问时用余弦相似度召回 Top-5 片段，拼进 Prompt 让 GPT-4o 生成答案。演示的时候效果不错，但运营实际用了两周给的反馈是："经常答非所问"、"给的信息不完整"、"同一个问题问两遍答案不一样"。</p>
+
+    <p>排查下来，核心问题出在 Chunk 策略上。</p>
+
+    <h2>Chunk 太大或太小都不行</h2>
+
+    <p>第一版固定 1000 字符切块的逻辑很简单：每 1000 个字符切一刀，不管这刀是不是切在段落中间、句子中间甚至单词中间。结果是什么？</p>
+
+    <p>用户问"如何配置 SSO 单点登录"，我们的 SSO 配置文档被切成了三块。第一块的末尾写着"进入管理后台，点击"，第二块开头写着"集成设置"，第三块讲的是 SAML 参数。这三块各自的语义都不完整，向量检索的时候系统只召回了其中两块，LLM 收到不完整的上下文，给了用户一个半截子的回答——漏了 OAuth 2.0 部分的关键步骤。</p>
+
+    <p>我试过把 Chunk 调大到 2000 字符，结果又出现了新问题：一个 Chunk 里塞进了多个不相关的主题。比如"SSO 配置"的第二步和"用户权限设置"的第一部分被塞进了同一个 Chunk，导致检索相关性下降——用户问权限问题的时候，系统把 SSO 相关的 Chunk 也召回了，噪音干扰了 LLM 的判断。</p>
+
+    <p>最终的发现是：Chunk 大小没有银弹，取决于文档结构和检索目标。对于我们的帮助文档，500-800 字符是一个比较好的平衡点，配合语义切分而非固定长度切分，每个 Chunk 尽量保持一个完整的语义单元。</p>
+
+    <h2>语义切分：按段落和标题结构切</h2>
+
+    <p>从固定长度切分切换到语义切分，效果提升立竿见影。LangChain 的 RecursiveCharacterTextSplitter 可以设置分隔符优先级——先按双换行（段落），再按单换行，再按句号，最后才是字符。这样切出来的 Chunk 至少不会把一句话劈成两半：</p>
+
+<pre><code class="language-python">from langchain.text_splitter import RecursiveCharacterTextSplitter
+
+splitter = RecursiveCharacterTextSplitter(
+    chunk_size=600,
+    chunk_overlap=100,
+    separators=["\n\n", "\n", "。", ".", " ", ""]
+)
+chunks = splitter.split_text(document)</code></pre>
+
+    <p>但这还不够。帮助文档里有很多带标题的结构化内容，比如一个三级标题下面的几个段落应该属于同一个语义单元。我用了一个额外的处理步骤：先按 Markdown 标题层级做粗切分（每个 h2/h3 区块是一个粗粒度段），然后在每个粗粒度段内部再细切。这样保证了同一个标题下的内容不会散落到不同 Chunk 里。</p>
+
+    <p>还有一个小优化：每个 Chunk 在向量化之前，把它的上级标题拼接进去作为元数据。比如一个只包含"在 Azure AD 中创建应用注册"这个步骤的 Chunk，前面拼上"SSO 配置 → SAML 集成 → Azure AD"，检索时语义更丰富、匹配更精准。</p>
+
+    <h2>Chunk Overlap：检索的"安全垫"</h2>
+
+    <p>语义切分解决了"不切散"的问题，但检索的时候仍然可能漏掉关键信息。用户问的问题经常需要跨 Chunk 的上下文。比如问"SSO 配置完成后用户登录的流程是什么"，答案可能一部分在"SSO 配置"的最后一个 Chunk，一部分在"用户登录"的第一个 Chunk。</p>
+
+    <p>Chunk Overlap 就是用来解决这个的。两个相邻 Chunk 之间保留 100-200 字符的重叠区，提高关键信息被至少一个 Chunk 完整捕获的概率。重叠区不宜太大——太大等于降低检索精度（每个 Chunk 里有太多重复内容），太小则起不到连接作用。</p>
+
+    <p>我用 600 字符 Chunk + 100 字符 Overlap 的组合跑了一批测试问题，召回准确率（至少一个相关 Chunk 被 Top-5 命中的比例）从固定切分的 72% 提到了 91%。</p>
+
+    <h2>嵌入模型选型：不是越新越好</h2>
+
+    <p>向量化这一步，模型的选择对检索质量影响很大。我对比了三个嵌入模型在中文技术文档上的表现：</p>
+
+    <p>OpenAI text-embedding-3-small：1536 维，速度快，中文效果中上，召回率基准值。</p>
+
+    <p>OpenAI text-embedding-3-large：3072 维，中文效果比 small 好约 8-10 个百分点，但 Token 成本高约 4 倍，向量存储空间翻倍。</p>
+
+    <p>BGE-M3（BAAI 的中英双语模型）：本地部署，1024 维，中文效果在技术文档场景下和 text-embedding-3-large 几乎持平，而且没有 API 调用成本。缺点是需要一张 GPU 跑推理。</p>
+
+    <p>我们最终选了 BGE-M3 本地部署。300 多篇文档一共生成大约 5000 个 Chunk，用 1024 维向量存储在 ChromaDB 里，总大小不到 100MB。查询延迟在 GPU 上约 80ms，完全可接受。</p>
+
+    <p>一个小发现：嵌入向量的归一化对中文文本的影响比英文明显。中文的分词粒度更细，同一个意思的不同表达方式可能导致向量方向偏差更大。对向量做 L2 归一化后再存，检索稳定性有明显改善。</p>
+
+    <h2>检索阶段的两个优化</h2>
+
+    <p>只用向量相似度做检索，在知识库场景下有一个已知缺陷：关键词匹配弱。用户用了一个专业术语的别称，向量相似度可能找不到对应的 Chunk（因为训练语料里没见过这种表达）。</p>
+
+    <p>我加了混合检索——向量检索 + BM25 关键词检索，结果合并去重。BM25 是经典的文本检索算法，不依赖语义理解，只看词频和逆文档频率。两个检索方式互补：向量检索擅长语义相近但用词不同的情况，BM25 擅长精确匹配专业术语。合并时用 Reciprocal Rank Fusion（RRF）打分：</p>
+
+<pre><code class="language-python">def reciprocal_rank_fusion(vector_results, bm25_results, k=60):
+    scores = {}
+    for rank, doc in enumerate(vector_results):
+        scores[doc.id] = scores.get(doc.id, 0) + 1 / (k + rank + 1)
+    for rank, doc in enumerate(bm25_results):
+        scores[doc.id] = scores.get(doc.id, 0) + 1 / (k + rank + 1)
+    return sorted(scores.items(), key=lambda x: x[1], reverse=True)</code></pre>
+
+    <p>第二个优化是元数据过滤。SaaS 平台有三个版本（基础版、专业版、企业版），不同版本的功能不同。如果企业版客户问一个问题，召回基础版的文档片段就是不相关噪音。在检索时加入版本号作为过滤条件，ChromaDB 的 where 参数直接支持：</p>
+
+<pre><code class="language-python">collection.query(
+    query_embeddings=[query_embedding],
+    n_results=5,
+    where={"version": {"$in": ["enterprise", "all"]}}
+)</code></pre>
+
+    <h2>生成阶段的 Prompt 设计</h2>
+
+    <p>检索做好了，生成阶段还有一件事：怎么让 LLM 正确使用召回的参考材料。最常见的两个问题——幻觉（编造参考材料里不存在的信息）和忽略（明明召回了相关材料却不用）。</p>
+
+    <p>我在 Prompt 里用了三个技巧。第一，给每个参考材料编号并标注来源（文档标题 + 章节），要求 LLM 在回答中引用编号。这不仅约束了 LLM 必须使用参考材料，还方便用户溯源。</p>
+
+    <p>第二，明确告诉 LLM"如果参考材料不足以回答问题，直接说不知道"。这条指令减少了强行编造答案的概率——虽然不能完全消除，但至少降低了。</p>
+
+    <p>第三，对参考材料做了重排序。向量检索返回的 Top-5 不一定按照最相关排序（尤其是混合检索后）。我把召回的 Chunk 在拼进 Prompt 之前再做一轮 LLM 重排序——用一个轻量的 rerank 模型（BGE-reranker-v2）对候选 Chunk 重新打分，只保留 Top-3，进一步提升 Prompt 内信息密度。</p>
+
+    <h2>ChromaDB vs Milvus：选型经验</h2>
+
+    <p>第一版用的 ChromaDB，因为它轻量——pip install 就能用，数据存在本地文件，不需要额外部署服务。5000 个 Chunk 的规模下跑得很流畅。</p>
+
+    <p>后来为了评估扩展性，也在测试环境搭了 Milvus。Milvus 的查询性能确实强：十万级向量规模下，召回延迟保持在 20ms 以内，而 ChromaDB 在同样规模下会涨到 100ms 以上。但 Milvus 的部署复杂度也高——需要 etcd、MinIO 做依赖，资源占用不小。</p>
+
+    <p>我的建议很直接：十万 Chunk 以下用 ChromaDB，省心。十万以上考虑 Milvus 或 Qdrant。我们的知识库预计未来两年也就涨到两万 Chunk，所以继续用 ChromaDB。</p>
+
+    <h2>Chunk 策略是 RAG 质量的第一道门槛</h2>
+
+    <p>做 RAG 项目这半年，最大的感悟是：大家讨论最多的是嵌入模型、向量数据库、LLM 选型，但实际决定 80% 检索质量的往往是 Chunk 策略。切分方式和大小选错了，后面换再好的模型也补不回来。</p>
+
+    <p>我验证过的有效流程：先分析文档结构（标题层级、段落平均长度、图文混排情况），设计切分方案，用一批测试问题跑检索评估（看 Top-5 召回里是否有包含正确答案的 Chunk），调整 Chunk 大小和 Overlap，再跑一轮。这个过程花两天时间，回报是后面几个月不用再为检索质量头疼。</p>
+
+    <p>还有一点容易被忽略：RAG 上线后的持续优化。文档会更新、会新增，Chunk 策略需要跟着调整。我们每个月跑一次检索质量回归测试，发现新增文档的检索有问题就及时调参。RAG 不是一个"建好就完了"的系统。</p>
+  </article>
+  <script src="../assets/js/common.js"></script>
+</body>
+</html>

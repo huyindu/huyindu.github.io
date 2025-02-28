@@ -1,6 +1,18 @@
 var POSTS_DATA = 
 [
   {
+    "title": "RAG 检索增强生成：从原理到 Chunk 策略",
+    "slug": "2025-02-28-rag-chunk-strategy",
+    "date": "2025-02-28",
+    "tags": [
+      "RAG",
+      "检索增强生成",
+      "向量数据库",
+      "Chunk"
+    ],
+    "summary": "深入 RAG 的检索和生成两阶段，对比不同文档切片和召回策略的效果差异"
+  },
+  {
     "title": "Prompt Engineering 实战：从模板到结构化输出",
     "slug": "2025-01-05-prompt-engineering-guide",
     "date": "2025-01-05",
