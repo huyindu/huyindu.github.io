@@ -1,0 +1,651 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Dify 搭建与 AI 应用开发实践：从零到 RAG 知识库问答系统 - HoEndo的技术博客</title>
+  <meta name="article-date" content="2025-04-13">
+  <meta name="article-tags" content="Dify,AI开发,RAG,知识库,LLM,实战教程">
+  <meta name="description" content="从零开始部署 Dify 开源 AI 开发平台，手把手构建 RAG 知识库问答系统，涵盖 Docker 部署、模型接入、工作流编排与生产实践。">
+</head>
+<body>
+
+  <article class="post-content">
+    <h1>Dify 搭建与 AI 应用开发实践：从零到 RAG 知识库问答系统</h1>
+
+    <p>想搭建一个基于私有知识库的 AI 问答机器人，但不想从零写 RAG 管道、向量检索、Prompt 编排这些基础设施？Dify 是目前社区最活跃的开源 LLM 应用开发平台——通过可视化界面拖拽就能完成从原型到生产的全流程。截至 2025 年 4 月，Dify 在 GitHub 已收获 60K+ Star，最新稳定版 v1.0.0（2025-03-31 发布）。</p>
+
+    <p>本文从 Docker 部署开始，带你走完模型接入 → 知识库构建 → 对话应用发布 → API 集成的完整链路。所有命令可直接复制执行。</p>
+
+    <h2>Dify 架构概览</h2>
+
+    <p>Dify 由多个微服务组成，通过 Docker Compose 一键编排：</p>
+
+    <table>
+      <thead>
+        <tr>
+          <th>服务</th>
+          <th>作用</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><code>api</code></td>
+          <td>核心 API 服务（Flask），处理业务逻辑</td>
+        </tr>
+        <tr>
+          <td><code>worker</code></td>
+          <td>Celery 异步任务队列，处理知识库索引等耗时操作</td>
+        </tr>
+        <tr>
+          <td><code>web</code></td>
+          <td>前端界面（Next.js），提供可视化操作面板</td>
+        </tr>
+        <tr>
+          <td><code>db</code></td>
+          <td>PostgreSQL（默认），存储应用配置和元数据</td>
+        </tr>
+        <tr>
+          <td><code>redis</code></td>
+          <td>缓存和 Celery 消息队列</td>
+        </tr>
+        <tr>
+          <td><code>weaviate</code></td>
+          <td>向量数据库（默认），存储文档向量用于 RAG 检索</td>
+        </tr>
+        <tr>
+          <td><code>sandbox</code></td>
+          <td>代码沙箱，用于 Agent 安全执行代码</td>
+        </tr>
+        <tr>
+          <td><code>nginx</code></td>
+          <td>反向代理，统一入口</td>
+        </tr>
+        <tr>
+          <td><code>ssrf_proxy</code></td>
+          <td>SSRF 防护代理，拦截内网请求</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <p>官方推荐的最低配置：<strong>2 核 CPU + 4GB 内存</strong>。实际使用建议 4 核 8GB 以上，尤其是需要处理大量文档的知识库场景。</p>
+
+    <h2>部署前准备</h2>
+
+    <h3>安装 Docker 和 Docker Compose</h3>
+
+    <p>Dify 官方推荐通过 Docker Compose 部署，这也是最省心的方式。如果你在国内服务器上操作，务必先配置镜像加速，否则拉取镜像会超时。</p>
+
+    <pre><code class="language-bash"># 安装 Docker（Debian/Ubuntu）
+curl -fsSL https://get.docker.com | bash
+
+# 配置 Docker 镜像加速（国内必做）
+sudo mkdir -p /etc/docker
+sudo tee /etc/docker/daemon.json &lt;&lt;EOF
+{
+  "registry-mirrors": [
+    "https://mirror.ccs.tencentyun.com",
+    "https://docker.m.daocloud.io"
+  ]
+}
+EOF
+sudo systemctl daemon-reload
+sudo systemctl restart docker
+
+# 验证安装
+docker --version
+docker compose version</code></pre>
+
+    <blockquote>
+      <p><strong>运行环境：</strong>本文命令在 Debian 12 + Docker 27 + Dify v1.0.0 环境验证通过。macOS / Ubuntu 同理，差异仅在 Docker 安装步骤。</p>
+    </blockquote>
+
+    <h2>快速部署 Dify</h2>
+
+    <h3>克隆项目并启动</h3>
+
+    <pre><code class="language-bash"># 克隆 Dify 仓库
+git clone https://github.com/langgenius/dify.git
+cd dify/docker
+
+# 复制环境变量模板
+cp .env.example .env
+
+# 一键启动
+docker compose up -d</code></pre>
+
+    <p>首次启动会自动拉取所有镜像，视网络情况 3-10 分钟不等。启动完成后检查服务状态：</p>
+
+    <pre><code class="language-bash">docker compose ps</code></pre>
+
+    <p>所有服务状态应该是 <code>Up</code>（healthy）。常见的几个服务端口：</p>
+
+    <ul>
+      <li><strong>Web 面板：</strong><code>http://你的IP</code>（Nginx 80 端口）</li>
+      <li><strong>API 服务：</strong><code>http://你的IP:5001</code></li>
+      <li><strong>Weaviate：</strong><code>http://你的IP:8080</code></li>
+    </ul>
+
+    <h3>初始化配置</h3>
+
+    <p>浏览器访问 <code>http://你的服务器IP/install</code>，进入初始化页面：</p>
+
+    <ol>
+      <li>设置管理员邮箱和密码</li>
+      <li>点击「初始化」按钮</li>
+      <li>自动跳转到登录页，用刚才的账号登录</li>
+    </ol>
+
+    <p>登录后进入 Dify 主界面，左侧导航栏包含：<strong>工作室</strong>（创建应用）、<strong>知识库</strong>（管理文档）、<strong>工具</strong>（自定义插件）、<strong>探索</strong>（应用模板市场）。</p>
+
+    <h2>接入大语言模型</h2>
+
+    <p>Dify 支持 100+ 模型提供商，包括 OpenAI、Anthropic Claude、DeepSeek、通义千问、文心一言、GLM 等。入口在右上角头像 → <strong>设置</strong> → <strong>模型供应商</strong>。</p>
+
+    <h3>接入 DeepSeek（推荐性价比之选）</h3>
+
+    <p>DeepSeek 的 API 与 OpenAI 完全兼容，且价格不到 GPT-4 的 1/20。在模型供应商列表中找到 DeepSeek，填入 API Key 即可。</p>
+
+    <p>获取 API Key：访问 <a href="https://platform.deepseek.com/api_keys" target="_blank" rel="noopener">platform.deepseek.com/api_keys</a>，注册后创建。</p>
+
+    <blockquote>
+      <p>Dify 的模型配置支持自定义 API Base URL，所以你也可以接入任何 OpenAI 兼容的代理服务、本地 Ollama/vLLM 部署的模型。</p>
+    </blockquote>
+
+    <h3>系统模型设置（关键）</h3>
+
+    <p>在设置 → <strong>系统模型设置</strong> 中，为不同场景指定默认模型：</p>
+
+    <table>
+      <thead>
+        <tr>
+          <th>场景</th>
+          <th>推荐模型</th>
+          <th>说明</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>系统推理模型</td>
+          <td>deepseek-chat</td>
+          <td>对话生成、任务编排的主模型</td>
+        </tr>
+        <tr>
+          <td>Embedding 模型</td>
+          <td>text-embedding-3-small</td>
+          <td>文档向量化，用于 RAG 检索</td>
+        </tr>
+        <tr>
+          <td>Rerank 模型</td>
+          <td>（可选）</td>
+          <td>对检索结果重排序，提高精度</td>
+        </tr>
+        <tr>
+          <td>语音转文字</td>
+          <td>（可选）</td>
+          <td>如需语音输入就配</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <p>配置完成后，可以在右侧的测试面板发送一条消息验证模型是否连通。</p>
+
+    <h2>构建 RAG 知识库</h2>
+
+    <p>知识库是 Dify 的核心能力之一。上传文档后，Dify 会自动完成分段（Chunking）、向量化（Embedding）、索引（Indexing），并提供检索接口给应用调用。</p>
+
+    <h3>RAG 工作流程</h3>
+
+    <p>先理解 RAG 的运作原理，后续操作才会心中有数：</p>
+
+    <ol>
+      <li><strong>文档上传</strong>：支持 PDF、Word、TXT、Markdown、网页链接等</li>
+      <li><strong>文本分段</strong>：将长文档切成若干段落（Chunk），默认 500 token/段</li>
+      <li><strong>向量化</strong>：用 Embedding 模型将每段文本转为高维向量</li>
+      <li><strong>索引存储</strong>：向量存入向量数据库（默认 Weaviate）</li>
+      <li><strong>检索</strong>：用户提问时，问题也转为向量，在向量库中搜索最相似的 Top-K 段落</li>
+      <li><strong>生成</strong>：将检索到的段落作为上下文注入 Prompt，由 LLM 生成回答</li>
+    </ol>
+
+    <h3>创建知识库</h3>
+
+    <p>进入「知识库」页面，点击「创建知识库」：</p>
+
+    <ol>
+      <li><strong>名称</strong>：如「产品技术文档」</li>
+      <li><strong>描述</strong>：可选，说明知识库用途</li>
+      <li><strong>权限</strong>：团队版可选「仅自己可见」或「团队可见」</li>
+    </ol>
+
+    <h3>上传文档</h3>
+
+    <p>进入刚创建的知识库，点击「添加文档」。Dify 支持三种数据源：</p>
+
+    <table>
+      <thead>
+        <tr>
+          <th>数据源</th>
+          <th>说明</th>
+          <th>适用场景</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>上传文件</td>
+          <td>PDF、TXT、Markdown、HTML、Word、Excel、CSV 等</td>
+          <td>产品手册、技术文档、合同</td>
+        </tr>
+        <tr>
+          <td>网页链接</td>
+          <td>输入 URL，Dify 自动抓取并解析正文</td>
+          <td>在线文档、博客文章</td>
+        </tr>
+        <tr>
+          <td>Notion / 网页</td>
+          <td>同步 Notion 数据库或整站抓取</td>
+          <td>团队知识库、Wiki</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <p>上传后，Dify 会自动触发处理流水线：分段 → 清洗 → 向量化 → 索引。处理进度在文档列表中实时显示。</p>
+
+    <h3>分段与索引策略（调优关键）</h3>
+
+    <p>在知识库设置中，有两个参数直接影响 RAG 效果：</p>
+
+    <ul>
+      <li><strong>分段最大长度</strong>（默认 500 tokens）：太大会稀释语义，太小会丢失上下文。中文文档建议 400-800，代码文档可设 800-1500。</li>
+      <li><strong>分段重叠长度</strong>（默认 50 tokens）：相邻两段之间的重叠部分，防止关键信息被切在边界上。</li>
+    </ul>
+
+    <p>在知识库设置中可以切换索引方式：</p>
+
+    <ul>
+      <li><strong>高质量模式</strong>：调用 Embedding 模型做语义检索，精度高，适合大多数场景</li>
+      <li><strong>经济模式</strong>：使用关键词匹配（BM25），不上传向量库，零成本但精度较低</li>
+    </ul>
+
+    <p>调优建议：先用默认参数跑通流程，观察召回效果。如果发现检索段落与问题不相关，再调整分段长度和重叠度。</p>
+
+    <h3>检索测试</h3>
+
+    <p>知识库页面右上角有「检索测试」入口。输入一个问题，Dify 会返回 Top-K 个最相关的文档片段及其相似度分数。这是调优分段策略的最佳工具——发现召回不准就回来改参数重新索引。</p>
+
+    <h2>创建 AI 对话应用</h2>
+
+    <p>知识库就绪后，开始创建第一个应用。</p>
+
+    <h3>应用类型选择</h3>
+
+    <p>点击「工作室」→「创建应用」，你会看到四种类型：</p>
+
+    <table>
+      <thead>
+        <tr>
+          <th>类型</th>
+          <th>说明</th>
+          <th>典型场景</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>聊天助手</td>
+          <td>多轮对话，可关联知识库</td>
+          <td>客服机器人、文档问答</td>
+        </tr>
+        <tr>
+          <td>文本生成</td>
+          <td>单次输入→输出，适合批处理</td>
+          <td>摘要生成、翻译、分类</td>
+        </tr>
+        <tr>
+          <td>Agent</td>
+          <td>自主推理+工具调用</td>
+          <td>数据分析、自动报告</td>
+        </tr>
+        <tr>
+          <td>工作流</td>
+          <td>可视化编排多步骤流程</td>
+          <td>复杂业务流程自动化</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <p>这里选择「聊天助手」来构建知识库问答系统。</p>
+
+    <h3>配置知识库检索</h3>
+
+    <p>创建应用后进入编排页面，核心配置在「上下文」区域：</p>
+
+    <ol>
+      <li>点击「添加」→ 选择刚创建的知识库</li>
+      <li>设置检索参数：<strong>Top-K</strong>（默认 3，即每次检索返回最相关的 3 个片段）和<strong>相似度阈值</strong>（默认 0.5，低于此分数的片段会被丢弃）</li>
+    </ol>
+
+    <p>Top-K 不宜过大：太多无关片段会稀释关键信息，反而降低回答质量。3-5 对大多数场景合适。</p>
+
+    <h3>编写 Prompt</h3>
+
+    <p>在「提示词」编辑区，你可以精确控制 LLM 的行为。Dify 提供了丰富的上下文变量：</p>
+
+    <pre><code class="language-markdown">你是一个专业的技术支持助手，请严格基于以下参考文档回答用户问题。
+
+## 参考文档
+{{#context#}}
+
+## 规则
+- 如果参考文档中有明确答案，直接引用原文回答
+- 如果参考文档中没有相关内容，请明确告知用户「此问题暂无相关文档」
+- 回答时注明引用的文档名称
+
+## 历史对话
+{{#conversation#}}
+
+## 用户问题
+{{#query#}}</code></pre>
+
+    <p>变量说明：</p>
+
+    <ul>
+      <li><code>{{#context#}}</code>：从知识库检索到的相关文档片段</li>
+      <li><code>{{#query#}}</code>：用户当前提问</li>
+      <li><code>{{#conversation#}}</code>：历史对话上下文</li>
+    </ul>
+
+    <h3>调试与发布</h3>
+
+    <p>右侧调试面板可以实时测试效果。输入问题后，Dify 会展示：</p>
+
+    <ul>
+      <li><strong>LLM 最终回答</strong></li>
+      <li><strong>检索到的文档片段</strong>（展开可查看来源）</li>
+      <li><strong>Token 用量和延迟</strong></li>
+    </ul>
+
+    <p>满意后点击「发布」，应用即可通过三种方式对外服务：<strong>Web 对话界面</strong>、<strong>内嵌 iframe</strong>、<strong>API 调用</strong>。</p>
+
+    <h2>工作流编排</h2>
+
+    <p>当对话型应用不够用时，工作流模式提供了更大的灵活性。</p>
+
+    <h3>工作流核心节点</h3>
+
+    <p>进入工作流编辑器，从左侧拖拽节点到画布上。关键节点类型：</p>
+
+    <table>
+      <thead>
+        <tr>
+          <th>节点类型</th>
+          <th>作用</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>开始</td>
+          <td>定义输入变量，触发工作流</td>
+        </tr>
+        <tr>
+          <td>LLM</td>
+          <td>调用大模型生成文本</td>
+        </tr>
+        <tr>
+          <td>知识检索</td>
+          <td>从知识库检索相关文档</td>
+        </tr>
+        <tr>
+          <td>代码</td>
+          <td>执行 Python/JavaScript 代码片段</td>
+        </tr>
+        <tr>
+          <td>条件分支</td>
+          <td>根据条件走向不同路径</td>
+        </tr>
+        <tr>
+          <td>HTTP 请求</td>
+          <td>调用外部 API</td>
+        </tr>
+        <tr>
+          <td>变量聚合</td>
+          <td>合并多个分支的输出</td>
+        </tr>
+        <tr>
+          <td>结束</td>
+          <td>定义输出变量</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <h3>示例：智能客服分流工作流</h3>
+
+    <p>假设你要做一个客服机器人，需要根据用户意图走不同处理路径：</p>
+
+    <ol>
+      <li><strong>开始节点</strong>：接收用户消息</li>
+      <li><strong>LLM 意图识别</strong>：判断用户意图是「售后」、「售前」还是「投诉」</li>
+      <li><strong>条件分支</strong>：根据意图走向不同路径
+        <ul>
+          <li>售后 → 检索售后知识库 → LLM 生成回复</li>
+          <li>售前 → 检索产品知识库 → LLM 生成推荐</li>
+          <li>投诉 → 直接转人工（HTTP 请求通知钉钉/飞书）</li>
+        </ul>
+      </li>
+      <li><strong>结束节点</strong>：返回最终回复</li>
+    </ol>
+
+    <p>这种设计避免了把所有知识混在一个库里检索，每条分支都有自己的专用知识库和 Prompt，回答更精准。</p>
+
+    <h2>Agent 智能体</h2>
+
+    <p>Agent 是 Dify 中自动化程度最高的应用类型。与对话型应用不同，Agent 可以自主决定调用哪些工具、以什么顺序调用。</p>
+
+    <h3>内置工具一览</h3>
+
+    <p>Dify 提供了 50+ 内置工具：</p>
+
+    <table>
+      <thead>
+        <tr>
+          <th>类别</th>
+          <th>工具示例</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>搜索</td>
+          <td>Google 搜索、Bing 搜索、Wikipedia</td>
+        </tr>
+        <tr>
+          <td>图像</td>
+          <td>DALL·E、Stable Diffusion</td>
+        </tr>
+        <tr>
+          <td>代码</td>
+          <td>Python 解释器、JavaScript 解释器</td>
+        </tr>
+        <tr>
+          <td>数据</td>
+          <td>SQL 查询、图表生成</td>
+        </tr>
+        <tr>
+          <td>效率</td>
+          <td>网页抓取、邮件发送、飞书通知</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <h3>创建 Agent 应用</h3>
+
+    <p>创建一个 Agent 类型应用后，与聊天助手最大的区别是多了「工具」配置区：</p>
+
+    <ol>
+      <li>点击「添加工具」→ 选择需要的工具</li>
+      <li>每个工具可以设置权限（是否允许自动调用）</li>
+      <li>在 Prompt 中描述工具的使用场景和约束</li>
+    </ol>
+
+    <p>Agent 的推理策略有两种：</p>
+
+    <ul>
+      <li><strong>Function Calling</strong>：依赖模型原生工具调用能力（需要模型支持），响应更快</li>
+      <li><strong>ReAct</strong>（Reasoning + Acting）：通过 Prompt 引导模型输出「思考→行动→观察」循环，兼容所有模型，但 Token 消耗更多</li>
+    </ul>
+
+    <h2>API 接入生产系统</h2>
+
+    <p>发布应用后，点击左侧「API 访问」标签页，可以拿到：</p>
+
+    <ul>
+      <li><strong>API 密钥</strong>（每个应用独立）</li>
+      <li><strong>API Base URL</strong></li>
+      <li><strong>交互式文档</strong>（Swagger UI 风格）</li>
+    </ul>
+
+    <h3>发送对话消息</h3>
+
+    <pre><code class="language-bash">curl -X POST 'https://your-dify-api/v1/chat-messages' \
+  -H 'Authorization: Bearer app-xxxxxxxxxxxxx' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "inputs": {},
+    "query": "如何配置 Docker 镜像加速？",
+    "response_mode": "streaming",
+    "conversation_id": "",
+    "user": "user-001"
+  }'</code></pre>
+
+    <p>响应模式有两种：</p>
+
+    <ul>
+      <li><strong>streaming</strong>：SSE 流式返回，适合聊天界面实时打字效果</li>
+      <li><strong>blocking</strong>：等完整生成后一次性返回，适合后端批处理</li>
+    </ul>
+
+    <h3>Python SDK 调用</h3>
+
+    <pre><code class="language-python">import requests
+
+url = "https://your-dify-api/v1/chat-messages"
+headers = {
+    "Authorization": "Bearer app-xxxxxxxxxxxxx",
+    "Content-Type": "application/json"
+}
+payload = {
+    "inputs": {},
+    "query": "如何配置 Docker 镜像加速？",
+    "response_mode": "blocking",
+    "conversation_id": "",
+    "user": "user-001"
+}
+
+resp = requests.post(url, json=payload, headers=headers)
+answer = resp.json()["answer"]
+print(answer)</code></pre>
+
+    <h3>获取会话列表</h3>
+
+    <p>Dify 的 API 还支持会话管理、消息历史、反馈标注等操作：</p>
+
+    <pre><code class="language-bash"># 获取用户会话列表
+curl -X GET 'https://your-dify-api/v1/conversations?user=user-001' \
+  -H 'Authorization: Bearer app-xxxxxxxxxxxxx'
+
+# 获取历史消息
+curl -X GET 'https://your-dify-api/v1/messages?conversation_id=xxx&user=user-001' \
+  -H 'Authorization: Bearer app-xxxxxxxxxxxxx'</code></pre>
+
+    <h2>生产环境注意事项</h2>
+
+    <h3>修改默认端口</h3>
+
+    <p>如果 80 端口已被占用，编辑 <code>.env</code> 文件中的 <code>EXPOSE_NGINX_PORT</code>：</p>
+
+    <pre><code class="language-bash"># 在 .env 中添加
+EXPOSE_NGINX_PORT=8080
+EXPOSE_NGINX_SSL_PORT=8443</code></pre>
+
+    <p>然后重启服务：</p>
+
+    <pre><code class="language-bash">docker compose down
+docker compose up -d</code></pre>
+
+    <h3>数据持久化</h3>
+
+    <p>Docker Compose 默认通过命名卷（named volumes）持久化数据，包括 PostgreSQL、Redis、Weaviate 的数据。检查卷：</p>
+
+    <pre><code class="language-bash">docker volume ls | grep dify</code></pre>
+
+    <p>定期备份建议：</p>
+
+    <pre><code class="language-bash"># 备份 PostgreSQL 数据
+docker exec dify-db_postgres-1 pg_dump -U postgres dify &gt; dify_backup.sql
+
+# 备份整个 volumes 目录
+tar -czf dify_data_backup.tar.gz /var/lib/docker/volumes/dify_*</code></pre>
+
+    <h3>性能优化</h3>
+
+    <ul>
+      <li><strong>增加 Worker 数量</strong>：在 <code>.env</code> 中调整 <code>SERVER_WORKER_AMOUNT</code>（默认 1）和 <code>CELERY_WORKER_AMOUNT</code>（默认 4）</li>
+      <li><strong>数据库连接池</strong>：<code>SQLALCHEMY_POOL_SIZE</code> 默认 30，高并发场景可加大</li>
+      <li><strong>向量库选择</strong>：Weaviate 开箱即用很省心，如果数据量超百万级可考虑 Milvus 或 Qdrant</li>
+    </ul>
+
+    <h3>HTTPS 配置</h3>
+
+    <p>Dify 的 docker-compose 内置了 certbot 容器用于自动申请 Let's Encrypt 证书。在 <code>.env</code> 中配置：</p>
+
+    <pre><code class="language-bash">NGINX_ENABLE_CERTBOT=true
+CERTBOT_EMAIL=your-email@example.com
+CERTBOT_DOMAIN=your-domain.com</code></pre>
+
+    <h2>踩坑记录</h2>
+
+    <h3>坑 1：Docker 镜像拉取超时（国内）</h3>
+
+    <p>症状：<code>docker compose up -d</code> 后一直卡在 Pulling，最终超时报错。</p>
+    <p>解法：在 <code>/etc/docker/daemon.json</code> 中添加多个镜像加速器，然后 <code>systemctl restart docker</code>。如果加速器也不够快，可以先用海外 VPS 拉取再导出导入。</p>
+
+    <h3>坑 2：Embedding 模型不兼容</h3>
+
+    <p>症状：上传文档后一直卡在「索引中」状态，日志显示 Embedding 调用失败。</p>
+    <p>解法：Dify 要求 Embedding 模型的输出维度与向量库一致。如果换了 Embedding 提供商，需要创建一个新知识库而不是在原库上切换模型。</p>
+
+    <h3>坑 3：知识库检索结果为空</h3>
+
+    <p>症状：文档已处理完成，但检索测试时返回空结果。</p>
+    <p>排查步骤：</p>
+    <ol>
+      <li>检查系统模型设置中的 Embedding 模型是否正确配置</li>
+      <li>检查知识库的索引模式是否是「高质量」（经济模式不走 Embedding）</li>
+      <li>调低相似度阈值到 0.3 试试</li>
+      <li>查看 Weaviate 日志确认向量是否写入成功</li>
+    </ol>
+
+    <h3>坑 4：Agent 循环调用工具停不下来</h3>
+
+    <p>症状：Agent 不停调用同一个工具，消耗大量 Token。</p>
+    <p>解法：在 Agent 应用设置中限制最大迭代次数（默认 50，建议设置 10-15）和超时时间（默认 120s）。在 Prompt 中明确指令：「如果连续两次调用同一工具返回相同结果，请停止并给出回答」。</p>
+
+    <h2>总结</h2>
+
+    <p>Dify 的价值在于把 LLM 应用开发中 80% 的重复工作（RAG 管道、向量检索、Prompt 管理、日志监控）都封装好了。剩下的 20% 才是你真正该投入的业务逻辑和领域知识。</p>
+
+    <p>本文覆盖的是一条完整的 Dify 落地路径：</p>
+
+    <ol>
+      <li><strong>Docker Compose 一键部署</strong>，3 分钟跑起来</li>
+      <li><strong>接入模型</strong>，支持 OpenAI / DeepSeek / 通义千问等 100+ 提供商</li>
+      <li><strong>构建知识库</strong>，理解分段策略和索引模式</li>
+      <li><strong>创建应用</strong>，从对话助手到 Agent 再到工作流</li>
+      <li><strong>API 集成</strong>，把 AI 能力嵌入现有系统</li>
+    </ol>
+
+    <p>建议先跑通基本流程，再逐步深入工作流编排和自定义工具开发。官方文档（<a href="https://docs.dify.ai" target="_blank" rel="noopener">docs.dify.ai</a>）和 GitHub Discussions 是最佳参考资料。</p>
+
+  </article>
+
+  <script src="../assets/js/common.js"></script>
+
+</body>
+</html>

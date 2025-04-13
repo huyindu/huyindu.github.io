@@ -1,6 +1,20 @@
 var POSTS_DATA = 
 [
   {
+    "title": "Dify 搭建与 AI 应用开发实践：从零到 RAG 知识库问答系统",
+    "slug": "2025-04-13-dify-rag-ai-app-tutorial",
+    "date": "2025-04-13",
+    "tags": [
+      "Dify",
+      "AI开发",
+      "RAG",
+      "知识库",
+      "LLM",
+      "实战教程"
+    ],
+    "summary": "从零开始部署 Dify 开源 AI 开发平台，手把手构建 RAG 知识库问答系统，涵盖 Docker 部署、模型接入、工作流编排与生产实践。"
+  },
+  {
     "title": "RAG 检索增强生成：从原理到 Chunk 策略",
     "slug": "2025-02-28-rag-chunk-strategy",
     "date": "2025-02-28",
