@@ -1,0 +1,529 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>.NET 8 + ABP + Consul + Redis + CAP 多租户微服务架构实践 - HoEndo的技术博客</title>
+  <meta name="article-date" content="2025-06-23">
+  <meta name="article-tags" content=".NET,ABP,微服务,Consul,Redis,CAP,多租户">
+  <meta name="description" content="基于 .NET 8 和 ABP 框架的多租户微服务架构设计与实现，涵盖 Consul 服务发现、Redis 分布式缓存、CAP 事件总线和数据库分片。">
+</head>
+<body>
+
+  <article class="post-content">
+    <h1>.NET 8 + ABP + Consul + Redis + CAP 多租户微服务架构实践</h1>
+
+    <h2>整体架构</h2>
+
+    <p>项目采用 DDD 分层架构，ABP 框架管模块化和依赖注入，Consul 做服务注册和配置中心，Redis 扛分布式缓存，CAP（基于 RabbitMQ）处理跨服务事件通信。数据库层加了 ShardingCore 做分库分表预留。</p>
+
+    <p>组件版本清单：</p>
+
+    <table>
+      <thead><tr><th>组件</th><th>版本</th><th>用途</th></tr></thead>
+      <tbody>
+        <tr><td>.NET SDK</td><td>8.0</td><td>运行时</td></tr>
+        <tr><td>ABP Framework</td><td>8.3.0</td><td>DDD 框架、多租户、模块化</td></tr>
+        <tr><td>DotNetCore.CAP</td><td>8.3.5</td><td>分布式事件总线</td></tr>
+        <tr><td>Consul</td><td>1.7.14</td><td>服务注册发现 + 配置中心</td></tr>
+        <tr><td>Redis (StackExchange)</td><td>—</td><td>分布式缓存</td></tr>
+        <tr><td>ShardingCore</td><td>7.8.1</td><td>分库分表</td></tr>
+        <tr><td>NLog</td><td>6.0</td><td>日志</td></tr>
+      </tbody>
+    </table>
+
+    <p>先上一张架构全景图：</p>
+
+    <pre class="mermaid">
+graph TD
+    subgraph "接入层"
+        N[Nginx / Gateway]
+    end
+
+    subgraph "TenantManage 控制面"
+        TM[TenantManage.HttpApi]
+        TMA[TenantManage.Application]
+        TME[TenantManage.EFCore]
+    end
+
+    subgraph "HttpApi 业务面"
+        API[HttpApi]
+        APP[Application]
+        DOM[Domain]
+        INFRA[Infrastructure.EFCore]
+    end
+
+    subgraph "基础设施"
+        C[(Consul 配置中心/服务发现)]
+        R[(Redis 缓存)]
+        MQ[[RabbitMQ - CAP]]
+        DB[(MySQL/PostgreSQL)]
+    end
+
+    subgraph "JobScheduler"
+        JH[JobScheduler.Host - Hangfire]
+    end
+
+    N --> TM
+    N --> API
+    TM --> MQ
+    API --> C
+    API --> R
+    API --> MQ
+    API --> DB
+    TM --> DB
+    JH --> DB
+    JH --> MQ
+    </pre>
+
+    <h2>项目分层</h2>
+
+    <p>严格按 ABP 推荐的 DDD 分层拆了 7 个项目：</p>
+
+    <table>
+      <thead><tr><th>层级</th><th>项目</th><th>职责</th></tr></thead>
+      <tbody>
+        <tr><td>表现层</td><td>HoEndo.HttpApi</td><td>Controller、JWT 认证、Swagger、中间件</td></tr>
+        <tr><td>应用层</td><td>HoEndo.Application</td><td>应用服务、DTO 映射、业务编排</td></tr>
+        <tr><td>应用契约</td><td>HoEndo.Application.Contracts</td><td>接口定义、DTO 声明</td></tr>
+        <tr><td>领域层</td><td>HoEndo.Domain</td><td>领域服务、事件处理、用户上下文</td></tr>
+        <tr><td>领域共享</td><td>HoEndo.Domain.Share</td><td>仓储接口、值对象、枚举、配置类</td></tr>
+        <tr><td>基础设施</td><td>HoEndo.Infrastructure.EFCore</td><td>DbContext、Repository 实现、Migration</td></tr>
+        <tr><td>公共工具</td><td>HoEndo.Common.Utility</td><td>CAP 配置、Consul、Redis、加密、中间件</td></tr>
+      </tbody>
+    </table>
+
+    <p>每个层的模块依赖通过 AbpModule 的 <code>[DependsOn]</code> 声明：</p>
+
+    <pre><code class="language-csharp">// HttpApiModule.cs
+[DependsOn(
+    typeof(AbpSwashbuckleModule),
+    typeof(AbpAspNetCoreMvcModule),
+    typeof(ApplicationModule),
+    typeof(AbpAutofacModule),
+    typeof(InfrastructureEFCoreModule),
+    typeof(AbpAspNetCoreMultiTenancyModule)
+)]
+public class HttpApiModule : AbpModule { }</code></pre>
+
+    <p>HttpApi 依赖 Application，Application 依赖 Domain，Domain 依赖 Domain.Share——形成单向依赖链。EFCore 层实现 Domain.Share 里定义的仓储接口。Common.Utility 作为横向公共层被多个模块引用。</p>
+
+    <h2>多租户设计</h2>
+
+    <p>ABP 内置的多租户机制覆盖了 90% 的场景。需要自定义的部分是租户解析——默认从 cookie、header、domain 解析，但前端和后端不在同一个域，cookie 方案走不通，只能从 URL 路径里提取租户标识。</p>
+
+    <p>自定义租户解析器：</p>
+
+    <pre><code class="language-csharp">// HoEndoTenantResolveContributor.cs
+public class HoEndoTenantResolveContributor : ITenantResolveContributor
+{
+    public string Name => "UrlPath";
+
+    public Task ResolveAsync(ITenantResolveContext context)
+    {
+        var httpContext = context.GetHttpContext();
+        if (httpContext == null) return Task.CompletedTask;
+
+        var path = httpContext.Request.Path.Value?.Trim('/');
+        if (string.IsNullOrEmpty(path)) return Task.CompletedTask;
+
+        // 从路径第一段提取租户编码：/tenant-code/api/controller/action
+        var segments = path.Split('/');
+        if (segments.Length > 0)
+        {
+            context.TenantIdOrName = segments[0];
+        }
+        return Task.CompletedTask;
+    }
+}
+
+// 注册到 ABP 租户解析链
+Configure&lt;AbpTenantResolveOptions&gt;(options =>
+{
+    options.TenantResolvers.Clear();
+    options.TenantResolvers.Add(new HoEndoTenantResolveContributor());
+});</code></pre>
+
+    <p>坑：ABP 的 UseMultiTenancy 中间件在租户解析失败时会默认中断请求。如果想让找不到租户的请求继续走认证流程（而不是直接 404），需要配置：</p>
+
+    <pre><code class="language-csharp">options.MultiTenancyMiddlewareErrorPageBuilder = async (context, exception) =>
+{
+    return false;  // 不中断请求
+};</code></pre>
+
+    <h2>Consul：配置中心 + 服务发现</h2>
+
+    <p>Consul 在这里干两份活——配置中心和服务注册发现。</p>
+
+    <h3>配置中心</h3>
+
+    <p>AppSettings 里的动态配置（redis 连接串、第三方 API key 等）放在 Consul KV store 里，通过 <code>Winton.Extensions.Configuration.Consul</code> 拉取，支持热更新：</p>
+
+    <pre><code class="language-csharp">// Program.cs - 从 Consul 读取配置
+void AppConfiguration(HostBuilderContext context, IConfigurationBuilder config, string[] args)
+{
+    config.AddJsonFile("HoEndoConfig.json", optional: true, reloadOnChange: true);
+    config.AddEnvironmentVariables();
+
+    // 先 build 一次拿到 Consul 的连接信息
+    context.Configuration = config.Build();
+
+    // 从 Consul KV 追加配置
+    config.AddConfigFromConsul(context.Configuration);
+}
+
+// ConsulConfigExtension.cs
+public static void AddConfigFromConsul(this IConfigurationBuilder builder, IConfiguration config)
+{
+    var consulConfig = config.GetSection("Consul").Get&lt;ConsulConfig&gt;();
+    if (consulConfig == null) return;
+
+    string consulUrl = $"http://{consulConfig.ConsulServerHost}:{consulConfig.ConsulServerPort}";
+    builder.AddConsul(consulConfig.ConfigFile, options =>
+    {
+        options.ConsulConfigurationOptions = cco =>
+        {
+            cco.Address = new Uri(consulUrl);
+            cco.Token = consulConfig.Token;
+        };
+        options.Optional = true;
+        options.ReloadOnChange = true;   // 配置变更自动重载
+        options.OnLoadException = ctx => { ctx.Ignore = false; };
+    });
+}</code></pre>
+
+    <p>配置优先级：Consul KV > 环境变量 > 本地 JSON > 命令行参数。</p>
+
+    <h3>服务注册与发现</h3>
+
+    <p>每个微服务启动时向 Consul 注册自己，带上健康检查端点：</p>
+
+    <pre><code class="language-csharp">// ConsulConfigExtension.cs - 注册服务
+public static void AddConsulServiceClient(this IServiceCollection services, IConfiguration config)
+{
+    var consulConfig = config.GetSection("Consul").Get&lt;ConsulConfig&gt;();
+
+    // 注册 Consul 客户端
+    services.AddConsul(options =>
+    {
+        options.Address = new Uri(
+            $"http://{consulConfig.ConsulServerHost}:{consulConfig.ConsulServerPort}");
+        options.Token = consulConfig.Token;
+    });
+
+    // 健康检查
+    var healthCheck = new AgentServiceCheck
+    {
+        HTTP = $"http://{consulConfig.CurrentNodeHost}:{consulConfig.CurrentNodePort}/health",
+        Interval = TimeSpan.FromSeconds(10),
+        Timeout = TimeSpan.FromSeconds(2),
+        DeregisterCriticalServiceAfter = TimeSpan.FromSeconds(30),  // 30秒不健康就踢掉
+    };
+
+    // 服务注册
+    services.AddConsulServiceRegistration(options =>
+    {
+        options.ID = consulConfig.CurrentNodeId;
+        options.Name = consulConfig.CurrentNodeName;
+        options.Address = consulConfig.CurrentNodeHost;
+        options.Port = consulConfig.CurrentNodePort;
+        options.Checks = new[] { healthCheck };
+    });
+}</code></pre>
+
+    <p>服务发现调用通过 <code>ConsulDiscoveryService</code> 封装：</p>
+
+    <pre><code class="language-csharp">public class ConsulDiscoveryService : ISingletonDependency
+{
+    public async Task&lt;string&gt; GetServiceUrlAsync(string serviceName)
+    {
+        var services = await _clientFactory.CreateClient()
+            .Catalog.Service(serviceName);
+        var service = services.Response.FirstOrDefault();
+        return service != null
+            ? $"http://{service.Address}:{service.ServicePort}"
+            : null;
+    }
+}</code></pre>
+
+    <h2>Redis 分布式缓存</h2>
+
+    <p>ABP 缓存抽象层非常干净——业务代码只依赖 <code>IDistributedCache&lt;T&gt;</code>，具体用什么存储由配置文件决定。项目里用的是 <code>Volo.Abp.Caching.StackExchangeRedis</code>：</p>
+
+    <pre><code class="language-csharp">// 注入配置
+context.Services.Configure&lt;RedisConfig&gt;(
+    configuration.GetSection("Redis"));
+
+// 配置写在 HoEndoConfig.json 或 Consul KV
+// "Redis": {
+//   "ConnectionStringList": ["192.168.0.60:6379"],
+//   "Password": "xxx",
+//   "InstanceName": "hoendo"
+// }</code></pre>
+
+    <p>使用方式很简单，注入即可：</p>
+
+    <pre><code class="language-csharp">public class TokenCacheProvider : ITokenCacheProvider
+{
+    private readonly IDistributedCache&lt;TokenInfo&gt; _cache;
+
+    public TokenCacheProvider(IDistributedCache&lt;TokenInfo&gt; cache)
+    {
+        _cache = cache;
+    }
+
+    public async Task SetAsync(TokenInfo token)
+    {
+        await _cache.SetAsync(token.TokenId, token);
+    }
+
+    public async Task&lt;TokenInfo&gt; GetAsync(string tokenId)
+    {
+        return await _cache.GetAsync(tokenId);
+    }
+}</code></pre>
+
+    <p>Cache Key 通过自定义 Normalizer 规范化，防止租户间的缓存冲突：</p>
+
+    <pre><code class="language-csharp">public class HoEndoDistributedCacheKeyNormalizer : IDistributedCacheKeyNormalizer
+{
+    public string NormalizeKey(DistributedCacheKeyNormalizeArgs args)
+    {
+        // 把租户 ID 织入 cache key，实现租户隔离
+        return $"hoendo:cache:{args.CacheName}:{args.Key}";
+    }
+}</code></pre>
+
+    <h2>CAP 分布式事件总线</h2>
+
+    <p>CAP 是项目里最核心的基础设施之一。场景很简单——租户开通后，TenantManage 服务需要通知 HttpApi 服务初始化租户数据。HTTP 轮询太重，直接调用耦合太紧，事件总线是最自然的解法。</p>
+
+    <h3>传输层：RabbitMQ</h3>
+
+    <pre><code class="language-csharp">// CapEventBusExtension.cs
+config.UseRabbitMQ(mqOptions =>
+{
+    mqOptions.HostName = rabbitMqConnection.Host;
+    mqOptions.Port = rabbitMqConnection.Port;
+    mqOptions.UserName = rabbitMqConnection.UserName;
+    mqOptions.Password = rabbitMqConnection.Password;
+    mqOptions.VirtualHost = rabbitMqConnection.VHost;
+    mqOptions.QueueOptions.AutoDelete = false;
+});</code></pre>
+
+    <h3>持久化：MySQL（可轻松切 PostgreSQL）</h3>
+
+    <p>实际项目用 MySQL 存 CAP 的消息表。切 PostgreSQL 只需要改一行：</p>
+
+    <pre><code class="language-csharp">// MySQL
+config.UseMySql(capConnectionString);
+// PostgreSQL - 换一个 NuGet 包即可
+config.UsePostgreSql(capConnectionString);</code></pre>
+
+    <p>CAP 在数据库里建三张表——<code>hoendo.cap.publish</code>（发出的消息）、<code>hoendo.cap.received</code>（收到的消息）、<code>hoendo.cap.lock</code>（分布式锁）。表名前缀全是自定义的，避免和 ABP 默认表名冲突。</p>
+
+    <pre><code class="language-csharp">// CapTableInitializer.cs - 自定义表名
+public class CapTableInitializer : IStorageInitializer
+{
+    public string GetPublishedTableName() => "hoendo.cap.publish";
+    public string GetReceivedTableName() => "hoendo.cap.received";
+    public string GetLockTableName() => "hoendo.cap.lock";
+}</code></pre>
+
+    <h3>可靠性配置</h3>
+
+    <pre><code class="language-csharp">config.DefaultGroupName = "cap.queue.hoendo";
+config.FailedRetryCount = 10;                          // 失败重试 10 次
+config.SucceedMessageExpiredAfter = 864000;            // 成功消息 10 天后清理
+config.FailedMessageExpiredAfter = 8640000;            // 失败消息 100 天后清理
+config.CollectorCleaningInterval = 3600;               // 每小时扫描一次过期消息
+config.UseStorageLock = true;                          // 启用分布式锁防止重复消费</code></pre>
+
+    <p>发事件很简单：</p>
+
+    <pre><code class="language-csharp">// 发布分布式事件
+await _capPublisher.PublishAsync("tenant.init", new TenantInitEo
+{
+    TenantId = tenant.Id,
+    TenantCode = tenant.Code
+});
+
+// 订阅事件
+[CapSubscribe("tenant.init")]
+public async Task HandleTenantInitAsync(TenantInitEo eo)
+{
+    // 初始化租户的数据库、默认菜单、默认角色
+    await _tenantInitService.InitAsync(eo.TenantId);
+}</code></pre>
+
+    <p>踩坑：CAP Dashboard 默认路径是 <code>/cap</code>，如果在生产环境暴露且没加授权，等于把消息队列的控制面板公开了。解决方案要么关 dashboard，要么加 Authorization Policy。项目里用的是一个更粗暴的做法——只在开发环境启用。</p>
+
+    <h2>数据库层：EF Core + ShardingCore</h2>
+
+    <p>ABP 的数据访问基于 EF Core。项目引入了 ShardingCore 做分库分表——虽然当前阶段还没真正启用分片，但架构上已经预留好了接口，未来切分库只需改配置，不动业务代码。</p>
+
+    <p>选 ShardingCore 而不是手动拼连接串的原因很简单：它支持按时间、按租户、按自定义规则分片，而且读写分离配置只需要在 JSON 里加一行 <code>"ReadWriteSeparation": true</code>。</p>
+
+    <p>DbContext 按租户隔离：</p>
+
+    <pre><code class="language-csharp">// HoEndoTenantDbContext.cs
+public class HoEndoTenantDbContext : HoEndoDbContext&lt;HoEndoTenantDbContext&gt;
+{
+    public HoEndoTenantDbContext(DbContextOptions&lt;HoEndoTenantDbContext&gt; options)
+        : base(options) { }
+
+    protected override void OnModelCreating(ModelBuilder modelBuilder)
+    {
+        // 租户相关的 Entity 配置
+        modelBuilder.Entity&lt;TenantUser&gt;(...);
+        modelBuilder.Entity&lt;TenantDept&gt;(...);
+        modelBuilder.Entity&lt;TenantRole&gt;(...);
+        // ...
+    }
+}</code></pre>
+
+    <p>Repository 实现遵循 ABP 规范——继承 <code>EfCoreRepository</code>，泛型参数绑定具体的 DbContext 和 Entity：</p>
+
+    <pre><code class="language-csharp">public class TenantUserRepository :
+    EfCoreRepository&lt;HoEndoTenantDbContext, TenantUser&gt;,
+    ITenantUserRepository
+{
+    public TenantUserRepository(
+        IDbContextProvider&lt;HoEndoTenantDbContext&gt; dbContextProvider,
+        IShardingRouteManager shardingRouteManager)
+        : base(dbContextProvider) { }
+}</code></pre>
+
+    <p>对于 PostgreSQL 用户：ABP 官方提供了 <code>Volo.Abp.EntityFrameworkCore.PostgreSql</code> 包。替换步骤——把 csproj 里的 MySql 引用换成 PostgreSql，EFCoreModule 的 <code>[DependsOn]</code> 从 <code>AbpEntityFrameworkCoreMySQLModule</code> 改为 <code>AbpEntityFrameworkCorePostgreSqlModule</code>，然后在 <code>Configure&lt;AbpDbContextOptions&gt;</code> 里调用 <code>options.UseNpgsql()</code>。CAP 也类似，<code>UseMySql</code> 换成 <code>UsePostgreSql</code>，加上 <code>DotNetCore.CAP.PostgreSql</code> 包。整个切换工作量大约半天，因为 ABP 抽象层把 SQL 方言差异屏蔽了。</p>
+
+    <h2>JWT 认证与授权</h2>
+
+    <p>不走 ABP 默认的 Identity，而是自建 JWT 认证流程。用户登录后签发 Token，后续请求通过自定义的 AuthenticationHandler 解析和验证：</p>
+
+    <pre><code class="language-csharp">// 注册自定义 JWT Handler
+services.AddAuthentication(x =>
+{
+    x.DefaultAuthenticateScheme = HoEndoJwtAuthenticationHandler.HoEndoJwtSchemeName;
+    x.DefaultChallengeScheme = HoEndoJwtAuthenticationHandler.HoEndoJwtSchemeName;
+    x.AddScheme&lt;HoEndoJwtAuthenticationHandler&gt;(
+        HoEndoJwtAuthenticationHandler.HoEndoJwtSchemeName,
+        HoEndoJwtAuthenticationHandler.HoEndoJwtSchemeName);
+});</code></pre>
+
+    <p>认证成功后，通过 <code>AuthMiddleware</code> 把用户信息（租户、角色、权限）加载到当前请求上下文的缓存中，避免每次都查 Redis/数据库：</p>
+
+    <pre><code class="language-csharp">// AuthMiddleware - 请求级用户信息缓存
+app.UseAuthentication();
+app.UseAuthorization();
+app.UseMiddleware&lt;AuthMiddleware&gt;();  // 在 Authorize 之后执行
+
+// 在 AuthMiddleware 中
+var userId = httpContext.User.FindFirst("sub")?.Value;
+var userContext = serviceProvider.GetRequiredService&lt;HoEndoUserContext&gt;();
+await userContext.InitializationAsync();
+// 之后 Controller 或 Service 里直接用 ICurrentUser</code></pre>
+
+    <h2>定时任务：Hangfire</h2>
+
+    <p>独立了一个 <code>HoEndo.JobScheduler.Host</code> 项目跑 Hangfire，负责定时任务——数据清理、报表生成、过期租户回收。也通过 CAP 和主服务通信：</p>
+
+    <pre><code class="language-csharp">// JobSchedulerModule.cs
+services.AddHangfire(config =>
+{
+    config.SetDataCompatibilityLevel(CompatibilityLevel.Version_180)
+          .UseSimpleAssemblyNameTypeSerializer()
+          .UseRecommendedSerializerSettings()
+          .UseMySqlStorage(connectionString, new MySqlStorageOptions
+          {
+              TablesPrefix = "hoendo.hangfire."
+          });
+});</code></pre>
+
+    <p>把 Hangfire 独立成一个 host 而不是嵌在 HttpApi 里，主要是为了避免定时任务和 Web 请求抢线程池资源。JobScheduler 挂了不影响 API 正常响应，反过来也一样。Hangfire 的 Dashboard 路径配了一个不常用的端口，只允许内网访问。</p>
+
+    <h2>ABP 模块化：把基础设施封装成可插拔 Module</h2>
+
+    <p>ABP 的模块系统让 Consul、CAP、Redis 这些基础设施的配置与业务代码解耦。比如 CAP 的所有配置逻辑封装在 <code>CapEventBusExtension</code> 里，Module 启动时调用一次 <code>services.AddCap(configuration)</code> 就完成全部初始化。</p>
+
+    <p>这种做法最大的好处是复用——新起的微服务项目里，.csproj 引一下 CommonUtilityModule，什么都不用配，Consul 注册、CAP 事件总线、Redis 缓存全都有了。踩过一个坑：如果两个微服务注册了相同名称的 CAP 消费者组，消息会被随机路由到其中一个，排查了好一阵才发现是 QueueName 冲突。所以每个微服务要有独立的 GroupName。</p>
+
+    <p>CommonUtilityModule 聚合了所有公共能力：</p>
+
+    <pre><code class="language-csharp">[DependsOn(
+    typeof(AbpCachingModule),
+    typeof(AbpCachingStackExchangeRedisModule)
+)]
+public class CommonUtilityModule : AbpModule
+{
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        var config = context.Services.GetConfiguration();
+        // CAP
+        context.Services.AddCap(config);
+        // Consul 服务发现
+        context.Services.AddConsulServiceClient(config);
+        // ...
+    }
+}</code></pre>
+
+    <p>这种模式下，新建一个微服务只需要依赖 <code>CommonUtilityModule</code>，不需要重复配置 CAP 和 Consul。</p>
+
+    <h2>部署结构</h2>
+
+    <p>最终部署形态是 Docker Compose 编排，大致长这样：</p>
+
+    <pre><code class="language-yaml">services:
+  consul:
+    image: consul:1.21
+  redis:
+    image: redis:8.0
+  rabbitmq:
+    image: rabbitmq:4.1-management
+  postgres:
+    image: postgres:16
+  httpapi:
+    build: ./Docker/HttpApi
+    environment:
+      - Consul__ConsulServerHost=consul
+      - Redis__ConnectionStringList__0=redis:6379
+      - RabbitMQ__Connection__Host=rabbitmq
+  tenant-manage:
+    build: ./Docker/TenantManage
+  jobscheduler:
+    build: ./Docker/JobScheduler</code></pre>
+
+    <p>Dockerfile 精简到只做发布和运行：</p>
+
+    <pre><code class="language-docker">FROM mcr.microsoft.com/dotnet/sdk:8.0 AS build
+WORKDIR /src
+COPY . .
+RUN dotnet publish HoEndo.HttpApi.csproj -c Release -o /app
+
+FROM mcr.microsoft.com/dotnet/aspnet:8.0
+WORKDIR /app
+COPY --from=build /app .
+ENTRYPOINT ["dotnet", "HoEndo.HttpApi.dll"]</code></pre>
+
+    <h2>总结几个实际踩坑</h2>
+
+    <ul>
+      <li><strong>Consul 健康检查时机：</strong>服务注册后 Consul 不会立即标记为健康。如果其他服务在启动阶段就去发现依赖服务，大概率吃闭门羹。加个重试逻辑或者在应用就绪后才注册。</li>
+      <li><strong>CAP 消息幂等：</strong>CAP 保证 at-least-once 投递，订阅方必须自己处理幂等。项目里用数据库唯一约束 + CAP 内置的 <code>UseStorageLock</code> 双重保障。</li>
+      <li><strong>ABP 租户解析和认证的执行顺序：</strong>中间件管道是 <code>UseMultiTenancy → UseAuthentication → UseAuthorization</code>。如果认证逻辑依赖租户上下文（比如不同租户用不同 JWT 密钥），必须确保认证在租户解析之后执行。</li>
+      <li><strong>ABP 自动 API 控制器的坑：</strong>ABP 默认会把所有 Application Service 自动暴露为 API。关掉它——在 HttpApiModule 里手动注册 Controller，避免内部服务意外暴露。</li>
+    </ul>
+
+    <hr>
+
+    <p>这套架构跑了大半年，经历过几轮压测和故障演练，核心链路（租户开通 → CAP 事件 → 数据初始化）的可靠性表现稳定。最大的收获是 ABP 的模块化和依赖注入让加新功能、拆新服务变得很简单——改几行 <code>[DependsOn]</code> 就行，不用牵扯大片代码。</p>
+
+    <script src="../assets/js/mermaid.min.js"></script>
+    <script>
+      mermaid.initialize({ startOnLoad: true, theme: 'dark' });
+    </script>
+  </article>
+
+  <script src="../assets/js/common.js"></script>
+
+</body>
+</html>

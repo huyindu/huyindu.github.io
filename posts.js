@@ -1,6 +1,21 @@
 var POSTS_DATA = 
 [
   {
+    "title": ".NET 8 + ABP + Consul + Redis + CAP 多租户微服务架构实践",
+    "slug": "2025-06-23-net8-abp-consul-redis-cap-arch",
+    "date": "2025-06-23",
+    "tags": [
+      ".NET",
+      "ABP",
+      "微服务",
+      "Consul",
+      "Redis",
+      "CAP",
+      "多租户"
+    ],
+    "summary": "基于 .NET 8 和 ABP 框架的多租户微服务架构设计与实现，涵盖 Consul 服务发现、Redis 分布式缓存、CAP 事件总线和数据库分片。"
+  },
+  {
     "title": "Dify 搭建与 AI 应用开发实践：从零到 RAG 知识库问答系统",
     "slug": "2025-04-13-dify-rag-ai-app-tutorial",
     "date": "2025-04-13",
