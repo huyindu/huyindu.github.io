@@ -1,6 +1,18 @@
 var POSTS_DATA = 
 [
   {
+    "title": "RAGFlow 使用入门教程：开源 RAG 引擎从部署到知识库构建",
+    "slug": "2025-07-10-ragflow-getting-started",
+    "date": "2025-07-10",
+    "tags": [
+      "RAGFlow",
+      "RAG",
+      "AI 应用",
+      "知识库"
+    ],
+    "summary": "部署 RAGFlow 开源 RAG 引擎，从文档解析到知识库构建和检索问答的完整入门教程"
+  },
+  {
     "title": ".NET 8 + ABP + Consul + Redis + CAP 多租户微服务架构实践",
     "slug": "2025-06-23-net8-abp-consul-redis-cap-arch",
     "date": "2025-06-23",
