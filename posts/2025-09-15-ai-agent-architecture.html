@@ -1,0 +1,218 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>AI Agent 架构设计：工具调用与记忆管理 - HoEndo的技术博客</title>
+  <meta name="article-date" content="2025-09-15">
+  <meta name="article-tags" content="AI Agent,Agent 架构,工具调用,记忆管理">
+  <meta name="description" content="设计 AI Agent 的核心架构：工具注册与调用机制、短期/长期记忆管理和状态流转">
+</head>
+<body>
+  <article class="post-content">
+    <h1>AI Agent 架构设计：工具调用与记忆管理</h1>
+
+<h2>一个失控的 Agent 教会我的事</h2>
+
+<p>去年自建第一个 Agent 的时候，给了一个"搜索文件"工具，一个"读取文件内容"工具，一个"写文件"工具。跑一个简单任务——"找出所有 YAML 里的过期配置并更新"——结果它陷入了可怕的循环：读一个文件，发现一行过期配置，改了，然后重新搜索，又读到同一个文件，发现同一行配置已经是最新的，但它不记得自己刚改过，于是尝试再改一次，然后搜索，又读到……Token 在 3 分钟内烧了 15 万，API 账单跳了两位数。</p>
+
+<p>这个教训让我重新审视了 Agent 架构的核心问题：工具调用不是简单的 function call，它需要和记忆系统、状态机紧密配合。</p>
+
+<h2>工具注册与发现</h2>
+
+<p>Agent 的工具系统本质上是一个注册中心。每个工具要回答三个问题：我能做什么、你需要给我什么、我会返回什么。JSON Schema 是目前最通用的描述方式：</p>
+
+<pre><code class="language-json">{
+  "name": "search_files",
+  "description": "按文件名模式查找文件，返回匹配路径列表",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "pattern": {
+        "type": "string",
+        "description": "文件名通配符，如 *.yaml"
+      },
+      "directory": {
+        "type": "string",
+        "description": "搜索起始目录，默认当前目录",
+        "default": "."
+      }
+    },
+    "required": ["pattern"]
+  }
+}</code></pre>
+
+<p>这里有个细节：<code>description</code> 不是给人看的，是给 LLM 看的。描述的好坏直接影响函数调用的准确率。我踩过一个坑——把 description 写得过于简短，LLM 在多个工具间反复试探，最后挑错了。后来把所有工具的 description 统一用"输入-行为-输出"三段式写清楚，误调用率显著下降。</p>
+
+<p>工具注册建议用装饰器模式，Python 里实现很简单：</p>
+
+<pre><code class="language-python">class ToolRegistry:
+    def __init__(self):
+        self._tools = {}
+
+    def register(self, name: str, schema: dict, func: Callable):
+        self._tools[name] = {"schema": schema, "func": func}
+
+    def get_schemas(self) -> list[dict]:
+        return [t["schema"] for t in self._tools.values()]
+
+    async def invoke(self, name: str, args: dict) -> ToolResult:
+        tool = self._tools[name]
+        return await tool["func"](**args)</code></pre>
+
+<p>2025 年几个主流框架的工具注册各有侧重。LangGraph 用 TypedDict 定义工具输入，类型检查更强但写起来啰嗦。CrewAI 用装饰器一行搞定，适合快速原型。OpenAI Assistants API 把工具注册和模型绑定在一起，最省事但灵活性最低。</p>
+
+<h2>工具调用循环</h2>
+
+<p>Agent 的核心执行流程是一个 while 循环：</p>
+
+<pre><code class="language-python">async def agent_loop(query: str, max_turns: int = 20):
+    messages = [{"role": "user", "content": query}]
+
+    for turn in range(max_turns):
+        response = await llm.chat(messages, tools=registry.get_schemas())
+
+        if response.finish_reason == "stop":
+            return response.content
+
+        for tool_call in response.tool_calls:
+            result = await registry.invoke(
+                tool_call.name, tool_call.arguments
+            )
+            messages.append({
+                "role": "tool",
+                "tool_call_id": tool_call.id,
+                "content": str(result)
+            })
+</code></pre>
+
+<p>这个循环看着简单，实则布满陷阱。</p>
+
+<h3>陷阱一：无限循环</h3>
+
+<p>Agent 调用工具后拿到结果，有时结果不满足预期，于是调另一个工具，另一个工具返回的结果又引导它调第一个……循环就这样发生了。<code>max_turns</code> 是兜底，但不能只靠它。我的做法是加一个 <strong>调用上限 + 降级策略</strong>：</p>
+
+<ul>
+  <li>硬上限：最大 15 轮工具调用，超了就强制终止</li>
+  <li>软上限：第 8 轮开始向 System Prompt 注入"你已调用多次工具，请尽快得出结论"</li>
+  <li>重复检测：连续 3 轮调用同一个工具且参数相似度超过 90%，截断并返回"检测到重复调用，当前结果："</li>
+</ul>
+
+<pre><code class="language-python">def should_degrade(turn: int, history: list) -> bool:
+    if turn >= 15:
+        return True, "hard_limit"
+    if turn >= 8:
+        return True, "soft_limit"
+    if detect_repeat_calls(history[-3:]):
+        return True, "repeat_detected"
+    return False, None</code></pre>
+
+<p>这个降级机制上线后，Token 浪费从高峰时的日均 30% 降到了不到 3%。</p>
+
+<h3>陷阱二：工具结果过大</h3>
+
+<p>Agent 调用"读取文件"拿到一个 5000 行的日志，LLM 的上下文窗口直接塞满。解决方式是 <strong>工具返回结果截断 + 分页</strong>：</p>
+
+<pre><code class="language-python">class ToolResult:
+    def __init__(self, data: Any, total_lines: int = None):
+        self.data = data[:2000]  # 字符截断
+        self.truncated = total_lines and len(data) < total_lines
+        if self.truncated:
+            self.data += f"\n... (共 {total_lines} 行，仅显示前 2000 字符)"</code></pre>
+
+<p>如果 Agent 需要更多内容，让它显式调用"继续读取"工具——这强迫它做出有意识的决策，而非无脑把数据灌进去。</p>
+
+<h2>记忆管理</h2>
+
+<h3>短期记忆：对话上下文</h3>
+
+<p>短期记忆就是 messages 数组本身。问题在于它线性增长：Agent 每调一次工具，messages 就多两条（assistant 的工具调用 + tool 的返回结果）。10 轮工具调用就是 20 条消息，加上系统提示和用户输入，轻松突破 15K token。</p>
+
+<p>解决策略：<strong>滑动窗口 + 摘要压缩</strong>。保留最近 8 轮完整消息，更早的消息用 LLM 生成摘要代替：</p>
+
+<pre><code class="language-python">async def compress_history(messages: list, keep_last: int = 16):
+    if len(messages) <= keep_last:
+        return messages
+
+    to_compress = messages[:-keep_last]
+    summary = await llm.chat([
+        {"role": "system", "content": "压缩以下对话为一段摘要"},
+        *to_compress
+    ])
+
+    return [
+        {"role": "system", "content": f"历史摘要：{summary}"},
+        *messages[-keep_last:]
+    ]</code></pre>
+
+<p>摘要压缩的时机也有讲究。不要在每次循环都压缩——等消息超过窗口的 70% 时再触发，减少不必要的 LLM 调用。</p>
+
+<h3>长期记忆：持久化存储</h3>
+
+<p>长期记忆解决跨会话的信息保有问题。比如 Agent 昨天查过一个 Bug，今天用户又问相关的问题，它应该记得昨天的排查结论。</p>
+
+<p>实现上分三层：</p>
+
+<p><strong>事实层</strong>：结构化的事实存储。用向量数据库存文本片段，每次对话结束后把关键结论做 embedding 存进去。下次对话开始时检索相关事实注入到 System Prompt：</p>
+
+<pre><code class="language-python">async def recall_memories(query: str, limit: int = 5) -> list[str]:
+    embedding = await get_embedding(query)
+    results = await vector_db.search(embedding, limit=limit)
+    return [r["text"] for r in results if r["score"] > 0.75]</code></pre>
+
+<p><strong>会话层</strong>：PostgreSQL 存完整对话历史。表结构很简单：</p>
+
+<pre><code class="language-sql">CREATE TABLE conversations (
+    session_id UUID,
+    turn_number INT,
+    role TEXT,
+    content TEXT,
+    created_at TIMESTAMP DEFAULT NOW()
+);</code></pre>
+
+<p><strong>偏好层</strong>：用户的隐性偏好。比如用户每次纠正 Agent 把"配置"写成"设置"，这个偏好应该被记住。用一个简单的 key-value 存储，Agent 在生成回复前查询用户偏好字典。</p>
+
+<p>我发现，长期记忆的关键不在存储技术，而在 <strong>检索时机和注入方式</strong>。盲目把所有历史记忆都注入上下文，反而干扰 Agent 的判断。做法是：只在 Agent 表达不确定性时触发记忆检索，而非每次对话都检索。</p>
+
+<h2>状态机设计</h2>
+
+<p>Agent 不是线性的。它在不同状态之间流转：理解问题、规划步骤、执行工具、验证结果、修正错误、输出答案。用有限状态机建模会清晰很多。</p>
+
+<pre><code class="language-python">class AgentState(Enum):
+    PLAN = "规划任务步骤"
+    EXECUTE = "执行工具调用"
+    OBSERVE = "观察工具返回结果"
+    EVALUATE = "评估是否达到目标"
+    RESPOND = "生成最终答案"
+    ERROR = "异常处理"
+
+class AgentFSM:
+    transitions = {
+        AgentState.PLAN: [AgentState.EXECUTE],
+        AgentState.EXECUTE: [AgentState.OBSERVE, AgentState.ERROR],
+        AgentState.OBSERVE: [AgentState.EVALUATE, AgentState.EXECUTE],
+        AgentState.EVALUATE: [AgentState.RESPOND, AgentState.PLAN],
+        AgentState.ERROR: [AgentState.PLAN, AgentState.RESPOND],
+    }</code></pre>
+
+<p>实际项目里，我并没有把状态机做成硬编码的 if-else 链，而是让 LLM 在每次循环时输出下一步状态和理由。经验是：<strong>让 LLM 自己决定状态转换，但用代码约束异常情况</strong>——ERROR 状态必须是代码触发（比如工具调用异常），RESPOND 状态后禁止再回到 EXECUTE。</p>
+
+<p>这种"软状态机"在 LangGraph 里有原生支持，用 <code>add_conditional_edges</code> 配合 LLM 判断就能实现。CrewAI 和 AutoGen 更多靠 prompt 驱动状态转换，缺乏显式的状态管理，复杂任务时容易发散。</p>
+
+<h2>框架选型建议</h2>
+
+<p>2025 年 Agent 框架格局基本清晰了：</p>
+
+<p><strong>LangGraph</strong>：图结构的执行引擎，状态管理和条件分支最强。适合需要精确控制流程的场景，但学习曲线陡。</p>
+
+<p><strong>CrewAI</strong>：角色扮演式多 Agent 协作，上手最快。适合快速原型和演示，但复杂任务的状态追踪偏弱。</p>
+
+<p><strong>AutoGen</strong>：微软出品，多 Agent 对话模式成熟。适合需要多个 Agent 对聊解决方案的场景。</p>
+
+<p><strong>OpenAI Assistants API</strong>：开箱即用但封闭，自定义工具的限制较多。适合不想维护基础设施的小团队。</p>
+
+<p>自建 Agent 的话，从实现成本和可控性平衡考虑，LangGraph + 自建工具注册层是最佳组合。LangGraph 管状态流转，工具注册层管工具生命周期，记忆系统独立一个模块。不要把所有逻辑塞进 LangGraph 的节点里——工具注册和记忆管理应该是框架无关的。</p>
+  </article>
+  <script src="../assets/js/common.js"></script>
+</body>
+</html>

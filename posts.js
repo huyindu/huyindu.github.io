@@ -1,6 +1,18 @@
 var POSTS_DATA = 
 [
   {
+    "title": "AI Agent 架构设计：工具调用与记忆管理",
+    "slug": "2025-09-15-ai-agent-architecture",
+    "date": "2025-09-15",
+    "tags": [
+      "AI Agent",
+      "Agent 架构",
+      "工具调用",
+      "记忆管理"
+    ],
+    "summary": "设计 AI Agent 的核心架构：工具注册与调用机制、短期/长期记忆管理和状态流转"
+  },
+  {
     "title": "RAGFlow 使用入门教程：开源 RAG 引擎从部署到知识库构建",
     "slug": "2025-07-10-ragflow-getting-started",
     "date": "2025-07-10",
