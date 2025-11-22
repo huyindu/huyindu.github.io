@@ -1,0 +1,259 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>数据清洗管道：LLM 时代的数据预处理 - HoEndo的技术博客</title>
+  <meta name="article-date" content="2025-11-22">
+  <meta name="article-tags" content="数据清洗,LLM,数据预处理,知识库">
+  <meta name="description" content="构建面向 LLM 应用的数据清洗管道：爬取、去重、格式清洗和质量评分">
+</head>
+<body>
+  <article class="post-content">
+    <h1>数据清洗管道：LLM 时代的数据预处理</h1>
+
+<h2>知识库上线一周后崩溃的检索质量</h2>
+
+<p>RAGFlow 知识库上线一周后，用户反馈检索结果"牛头不对马嘴"。排查后发现三个致命问题：2000 份文档里有 300 多份是同一份部署手册的变体（改了几个 IP 地址就当新文档传上去了）；PDF 转文本后残留大量页眉页脚字符（"第 X 页 / 共 Y 页"）污染了 embedding；还有一批从 Confluence 爬下来的页面，Markdown 格式全乱了，代码块和正文混在一起。</p>
+
+<p>这些问题在构建知识库时完全没察觉——文档能正常上传、解析、索引，没有报错。但检索质量一塌糊涂。GIGO（Garbage In, Garbage Out）在 LLM 时代不是变弱了，是更隐蔽了：数据看起来"能用"，实则毒害着每一条 embedding。</p>
+
+<h2>管道总览</h2>
+
+<p>清洗管道分四个阶段：爬取 → 去重 → 格式清洗 → 质量评分。每个阶段独立运行，通过 JSONL 中间文件传递数据，方便单独调试和重跑。</p>
+
+<pre><code class="language-python"># pipeline.py
+class CleaningPipeline:
+    def __init__(self):
+        self.stages = [
+            CrawlerStage(),
+            DedupStage(),
+            FormatCleanStage(),
+            QualityScoreStage(),
+        ]
+
+    async def run(self, sources: list[str], output: str):
+        data = await self.stages[0].execute(sources)
+        for stage in self.stages[1:]:
+            data = await stage.execute(data)
+        write_jsonl(output, data)
+        return data</code></pre>
+
+<p>中间文件格式：</p>
+
+<pre><code class="language-json">{"id": "doc_001", "source": "confluence://page/123", "raw_text": "...", "stage": "crawled"}
+{"id": "doc_001", "source": "confluence://page/123", "raw_text": "...", "stage": "deduped"}
+{"id": "doc_001", "source": "confluence//page/123", "raw_text": "...", "stage": "cleaned"}
+{"id": "doc_001", "source": "confluence//page/123", "raw_text": "...", "quality_score": 0.87, "stage": "scored"}</code></pre>
+
+<h2>阶段一：爬取</h2>
+
+<p>数据源通常有三种：内部 Wiki（Confluence、语雀）、文件服务器（NAS 上的 PDF/Word/Excel）、外部网站（官方文档、技术博客）。</p>
+
+<p>Confluence 爬取用 <code>atlassian-python-api</code>，注意处理分页和附件：</p>
+
+<pre><code class="language-python">from atlassian import Confluence
+
+cf = Confluence(url="https://wiki.company.com", token=os.getenv("CF_TOKEN"))
+
+def crawl_space(space_key: str) -> list[dict]:
+    docs = []
+    start = 0
+    while True:
+        pages = cf.get_all_pages_from_space(
+            space_key, start=start, limit=50
+        )
+        if not pages:
+            break
+        for page in pages:
+            body = cf.get_page_by_id(
+                page["id"], expand="body.storage"
+            )
+            docs.append({
+                "id": page["id"],
+                "title": page["title"],
+                "body": strip_html(body["body"]["storage"]["value"]),
+                "source": f"confluence://{space_key}/{page['id']}"
+            })
+        start += 50
+    return docs</code></pre>
+
+<p>外部网页爬取我用 Jina AI 的 Reader API，一行请求就把网页转成干净的 Markdown：</p>
+
+<pre><code class="language-bash">curl https://r.jina.ai/https://docs.python.org/3/library/asyncio.html \
+  -H "Authorization: Bearer $JINA_API_KEY"</code></pre>
+
+<p>比 BeautifulSoup 手写选择器省心太多——自动去广告、去导航栏、去侧边栏，只留正文。但 Jina Reader 对动态渲染页面无能为力，遇到 SPA 页面得用 Playwright 先渲染。</p>
+
+<h2>阶段二：去重</h2>
+
+<p>去重分两步：精确去重和近似去重。</p>
+
+<p>精确去重用 SHA256 哈希，秒级完成：</p>
+
+<pre><code class="language-python">import hashlib
+
+seen = set()
+unique = []
+for doc in docs:
+    doc_hash = hashlib.sha256(doc["raw_text"].encode()).hexdigest()
+    if doc_hash not in seen:
+        seen.add(doc_hash)
+        unique.append(doc)
+print(f"去重：{len(docs)} → {len(unique)}，移除 {len(docs) - len(unique)} 份")</code></pre>
+
+<p>但精确去重解决不了变体问题——同一份文档改了几个参数又重新上传。这需要近似去重。</p>
+
+<p>用 <code>dedupe</code> 库做模糊匹配。先对所有文本做 MinHash，然后聚类相似文档：</p>
+
+<pre><code class="language-python">import dedupe
+from dedupe.core import randomPairs
+
+data = {d["id"]: {"text": d["raw_text"]} for d in docs}
+deduper = dedupe.Dedupe([{"field": "text", "type": "Text"}])
+deduper.sample(data, sample_size=1500)
+
+# 训练后聚类
+clusters = deduper.match(data, threshold=0.6)
+# 每组聚类只保留最长的那份文档
+for cluster in clusters:
+    keep = max(cluster[0], key=lambda cid: len(data[cid]["text"]))
+    for cid in cluster[0]:
+        if cid != keep:
+            data.pop(cid)</code></pre>
+
+<p><code>threshold=0.6</code> 是我实测后的经验值。设 0.5 会把不同版本的文档（确实有内容更新）误判为重复；设 0.7 则漏掉太多实际重复的变体。</p>
+
+<p>去重阶段的产出让我震惊：2000 份文档去重后只剩 1100 份。将近一半是重复或高度相似的。如果不是这个去重步骤，向量库里会有大量高度重叠的 embedding，检索时 Top-K 基本被这些"双胞胎文档"霸占。</p>
+
+<h2>阶段三：格式清洗</h2>
+
+<p>格式清洗是整个管道里最脏最累的活。面对的问题是：页眉页脚字符、多余换行、编码乱码、Markdown 格式错误、HTML 残留标签。</p>
+
+<p>正则一把梭的思路行不通——规则多了互相冲突。做法是分优先级，逐层清洗：</p>
+
+<pre><code class="language-python">import re
+
+class FormatCleaner:
+    # 优先级从高到低
+    RULES = [
+        # 1. 删除页眉页脚
+        (r"第\s*\d+\s*页\s*[/／]\s*共\s*\d+\s*页", ""),
+        (r"^\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}.*?\|.*$", ""),
+        # 2. 修复编码乱码
+        (r"鈥⑩€?", "—"),  # em dash 乱码
+        (r"鈥?", "…"),     # 省略号乱码
+        # 3. 规范化空白
+        (r"\n{3,}", "\n\n"),
+        (r"[ \t]{2,}", " "),
+        # 4. 去除 HTML 残留
+        (r"<[^>]+>", ""),
+        # 5. 去除零宽字符
+        (r"[\u200b\u200c\u200d\ufeff]", ""),
+    ]
+
+    def clean(self, text: str) -> str:
+        for pattern, replacement in self.RULES:
+            text = re.sub(pattern, replacement, text)
+        return text.strip()</code></pre>
+
+<p>编码乱码那块吃了大亏。一批从 Windows 服务器导出的文档，GBK 编码的文件被用 UTF-8 强行解析，大量中文字符变成乱码。ftfy 库救了一命：</p>
+
+<pre><code class="language-python">import ftfy
+
+# 自动修复 mojibake
+text = ftfy.fix_text(text)
+# 输出："部署手册" → 原来是 "閮ㄧ讲镓嬪唽"</code></pre>
+
+<p>代码块和正文的分离也是一个坑。Confluence 导出的页面经常把代码块和正文混在一起，导致 embedding 把 Python 代码的语义和中文描述混为一谈。我的处理方式是识别代码块边界并打标签：</p>
+
+<pre><code class="language-python">def tag_code_blocks(text: str) -> str:
+    # 识别 ``` 或缩进代码块
+    in_block = False
+    lines = text.split("\n")
+    result = []
+    for line in lines:
+        if line.strip().startswith("```"):
+            in_block = not in_block
+            result.append("[CODE_BLOCK]")
+            continue
+        if in_block or line.startswith("    "):
+            result.append(f"[CODE] {line}")
+        else:
+            result.append(line)
+    return "\n".join(result)</code></pre>
+
+<p>清洗后文本的"干净程度"用 textstat 量化：</p>
+
+<pre><code class="language-python">import textstat
+
+def assess_cleanliness(text: str) -> float:
+    sentences = textstat.sentence_count(text)
+    non_ascii_ratio = sum(1 for c in text if ord(c) > 127) / max(len(text), 1)
+    # 评分：句子长度合理性 + 非 ASCII 比例合理性
+    score = min(1.0, sentences / 100) * 0.4 + non_ascii_ratio * 0.6
+    return round(score, 2)</code></pre>
+
+<h2>阶段四：质量评分</h2>
+
+<p>清洗完不代表文档质量合格。质量评分回答的是：这份文档值不值得进知识库。</p>
+
+<p>我设了四个维度打分，加权汇总：</p>
+
+<pre><code class="language-python">def quality_score(doc: dict) -> tuple[float, dict]:
+    scores = {}
+
+    # 1. 文本长度分（太短含信息量低，太长可能是日志堆砌）
+    length = len(doc["clean_text"])
+    if length < 200:
+        scores["length"] = 0.2
+    elif length < 500:
+        scores["length"] = 0.5
+    elif length < 5000:
+        scores["length"] = 0.9
+    else:
+        scores["length"] = 0.7  # 过长可能啰嗦
+
+    # 2. 结构完整性分
+    has_title = bool(re.search(r"^#+\s", doc["clean_text"]))
+    has_list = bool(re.search(r"^\s*[-*+]\s", doc["clean_text"], re.M))
+    has_code = bool(re.search(r"```", doc["clean_text"]))
+    scores["structure"] = (has_title * 0.4 + has_list * 0.3 + has_code * 0.3)
+
+    # 3. 信息密度分
+    words = len(re.findall(r"[\u4e00-\u9fff]+|[a-zA-Z]+", doc["clean_text"]))
+    total = max(len(doc["clean_text"]), 1)
+    scores["density"] = min(1.0, words / total)
+
+    # 4. 可读性分
+    scores["readability"] = min(1.0, textstat.automated_readability_index(
+        doc["clean_text"]
+    ) / 15)
+
+    total = (
+        scores["length"] * 0.3
+        + scores["structure"] * 0.25
+        + scores["density"] * 0.25
+        + scores["readability"] * 0.2
+    )
+    return round(total, 2), scores</code></pre>
+
+<p>质量评分低于 0.4 的直接丢弃，0.4-0.6 的打上"低质量"标签进入知识库但降低检索权重，0.6 以上的正常入库。这个分层策略比一刀切灵活——低质量文档在某些场景（比如内部运维手册）仍有保留价值，但在通用检索里不会干扰结果。</p>
+
+<h2>管道落地后的效果</h2>
+
+<p>清洗管道跑完后，知识库文档从 2000 份精简到 1100 份，检索 Top-5 的命中率从 62% 提升到 89%。用户投诉从"搜不到想要的"变成了"搜出来太精准有点不习惯"。</p>
+
+<p>几个花费最多时间的地方：</p>
+
+<ul>
+  <li>去重阈值调参。不同文档类型的相似度分布差异巨大，API 文档阈值 0.5 足够，FAQ 文档得调到 0.65。后来做了按文档类型自动调整阈值的逻辑。</li>
+  <li>编码修复。Windows 导出的文档编码混乱远超预期，ftfy 是好东西但也不是万能，偶尔仍需手动检查。</li>
+  <li>Jina Reader 限流。免费版每分钟 20 请求，大批量爬取时经常 429。后来加了指数退避重试，同时付费升级了套餐。</li>
+</ul>
+
+<p>这条管道已经成为我所有知识库项目的前置步骤。不管是接 RAGFlow 还是 Dify，数据不洗直接进库的行为等同于往数据库里倒垃圾。</p>
+  </article>
+  <script src="../assets/js/common.js"></script>
+</body>
+</html>

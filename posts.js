@@ -1,6 +1,18 @@
 var POSTS_DATA = 
 [
   {
+    "title": "数据清洗管道：LLM 时代的数据预处理",
+    "slug": "2025-11-22-data-cleaning-pipeline-llm",
+    "date": "2025-11-22",
+    "tags": [
+      "数据清洗",
+      "LLM",
+      "数据预处理",
+      "知识库"
+    ],
+    "summary": "构建面向 LLM 应用的数据清洗管道：爬取、去重、格式清洗和质量评分"
+  },
+  {
     "title": "AI Agent 架构设计：工具调用与记忆管理",
     "slug": "2025-09-15-ai-agent-architecture",
     "date": "2025-09-15",
