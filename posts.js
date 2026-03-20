@@ -1,6 +1,18 @@
 var POSTS_DATA = 
 [
   {
+    "title": "HE 驾驭工程：从 Prompt 到 Agent 系统控制",
+    "slug": "2026-03-20-he-steering-engineering",
+    "date": "2026-03-20",
+    "tags": [
+      "驾驭工程",
+      "AI Agent",
+      "多 Agent",
+      "系统设计"
+    ],
+    "summary": "驾驭工程方法论：从单条提示词到多 Agent 协调系统，通过规则和约束驾驭 Agent 行为"
+  },
+  {
     "title": "数据清洗管道：LLM 时代的数据预处理",
     "slug": "2025-11-22-data-cleaning-pipeline-llm",
     "date": "2025-11-22",

@@ -1,0 +1,210 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>HE 驾驭工程：从 Prompt 到 Agent 系统控制 - HoEndo的技术博客</title>
+  <meta name="article-date" content="2026-03-20">
+  <meta name="article-tags" content="驾驭工程,AI Agent,多 Agent,系统设计">
+  <meta name="description" content="驾驭工程方法论：从单条提示词到多 Agent 协调系统，通过规则和约束驾驭 Agent 行为">
+</head>
+<body>
+  <article class="post-content">
+    <h1>HE 驾驭工程：从 Prompt 到 Agent 系统控制</h1>
+
+<h2>每一次对话都是全新的谈判</h2>
+
+<p>2025 年初我开始高频使用 Claude Code。每天早上打开终端，第一件事不是写代码，是写一段 200 字的 System Prompt——告诉 Claude 我今天打算做什么、用什么风格、避开哪些坑。这段 prompt 每天都要重新写一遍，因为 Claude 不记得昨天我们是怎么合作的。</p>
+
+<p>这就是"每次对话都是一次全新的谈判"——Agent 没有关于"我们是怎么协作的"的记忆，它的行为完全依赖你此刻塞进上下文窗口的指令。</p>
+
+<p>到 2025 年底，"驾驭工程"（Human Enhancement / Steering Engineering，HE）这个概念在国内 AI 编程圈子里开始流行。它的核心很简单：<strong>不要每次重新告诉 Agent 怎么工作，而是建立一套持久的规则系统，让 Agent 的行为始终保持一致</strong>。</p>
+
+<h2>从 Prompt 到规则文件</h2>
+
+<p>最初我是手动写 prompt。一个 React 组件生成 prompt、一个 API 接口开发 prompt、一个 Bug 修复 prompt……很快就收集了 20 多个模板。问题也随之而来：</p>
+
+<ul>
+  <li>模板多了找不到，每次都翻目录</li>
+  <li>模板之间冲突，Bug 修复模板说"保持最小改动"，组件模板说"遵循完整规范"</li>
+  <li>项目变了模板没跟着更新，三个月前的模板已经不适合现在的代码风格</li>
+</ul>
+
+<p>转折点是意识到 <strong>prompt 不应该是一次性的输入，而应该是版本化的、可组合的规则文件</strong>。SKILL.md 是这个思想的落地形式——一个 Markdown 文件，描述 Agent 在特定场景下应该遵循的全部规则。</p>
+
+<p>SKILL.md 的结构我踩了三次坑才稳定下来：</p>
+
+<pre><code class="language-markdown"># Skill Name
+
+## 适用场景
+用户说"新建一个 API 接口"、"添加接口"时激活
+
+## 核心规则
+1. 路由文件在 `src/routes/` 下，命名 `{resource}.ts`
+2. 必须包含请求验证（zod schema）
+3. 错误处理统一用 `throw AppError`
+4. 数据库操作必须通过 repository 层，禁止在路由中直接写 SQL
+
+## 禁止项
+- 禁止使用 any 类型
+- 禁止在路由中直接访问数据库连接
+- 禁止返回未经脱敏的用户数据
+
+## 示例
+### 正确示例
+```typescript
+// 代码示例
+```
+
+### 错误示例
+```typescript
+// 反例
+```
+</code></pre>
+
+<p>这个结构里最容易被忽略的是"禁止项"——但恰恰是它最有用。告诉 Agent "不要做什么"比告诉它"要做什么"能更精确地控制行为边界。</p>
+
+<h2>SKILL.md 的工程化</h2>
+
+<p>单个 SKILL.md 管理起来简单，但一个项目动辄 5-10 个 skill 文件后，新的问题出现了。</p>
+
+<h3>冲突解决</h3>
+
+<p>当一个规则说"改动后必须写测试"，另一个说"保持最小改动不新增文件"，Agent 在两者之间犹豫。解决方案是引入 <strong>优先级系统</strong>：</p>
+
+<pre><code class="language-yaml"># .hermes/skills/manifest.yaml
+skills:
+  - name: "api-dev"
+    path: "api-dev.skill.md"
+    priority: 10
+    triggers: ["新建接口", "添加 API"]
+
+  - name: "minimal-change"
+    path: "minimal-change.skill.md"
+    priority: 5
+    triggers: ["修复 bug", "改一行"]
+
+rules:
+  # 高优先级覆盖低优先级
+  conflict_resolution: "highest_priority_wins"
+  # 当规则明确矛盾时，在上下文显式标注
+  flag_in_context: true</code></pre>
+
+<p>让 Agent 在接收规则时就知道优先级，而不是让它自己猜——Agent 不擅长权衡互斥规则，但它擅长执行明确的约束。</p>
+
+<h3>热加载与版本控制</h3>
+
+<p>SKILL.md 存在项目仓库里，跟着代码一起版本控制。这意味着：</p>
+
+<ul>
+  <li>切分支时规则自动切换（feature 分支可能用新版开发规范）</li>
+  <li>规则变更可以 Code Review</li>
+  <li>新人 clone 仓库时就带着团队的最佳实践</li>
+</ul>
+
+<p>Agent 启动时读取项目根目录的 <code>.hermes/skills/</code> 目录，根据用户输入匹配 rules，注入到 System Prompt。关键实现：</p>
+
+<pre><code class="language-python">class SkillLoader:
+    def __init__(self, skills_dir: Path):
+        self.skills = {}
+        self.load(skills_dir)
+
+    def load(self, directory: Path):
+        for f in directory.glob("*.skill.md"):
+            skill = self.parse_skill(f)
+            self.skills[skill["name"]] = skill
+
+    def match(self, user_input: str) -> list[dict]:
+        """匹配所有触发词命中或语义相关的 skill"""
+        matched = []
+        for skill in self.skills.values():
+            for trigger in skill["triggers"]:
+                if trigger in user_input:
+                    matched.append(skill)
+                    break
+        # 按优先级降序排列
+        return sorted(matched, key=lambda s: s["priority"], reverse=True)</code></pre>
+
+<h2>驾驭多 Agent 系统</h2>
+
+<p>单个 Agent 用规则文件就能管住，多 Agent 协作才是真正的复杂度爆发点。</p>
+
+<p>2026 年初我搭建了一个三人 Agent 小组：架构师 Agent（设计方案）、开发者 Agent（写代码）、审查者 Agent（检查质量）。三个 Agent 用同一套 SKILL.md 却产生了完全不同的行为：架构师过于保守，开发者过于激进，审查者吹毛求疵。</p>
+
+<p>问题的根因：<strong>同一套规则无法同时适应不同角色</strong>。解决方式是给每个 Agent 追加角色特定的规则叠加层：</p>
+
+<pre><code class="language-yaml">agents:
+  - name: "architect"
+    base_skills: ["general-coding", "system-design"]
+    overlay:
+      tone: "严谨但鼓励探索"
+      constraints:
+        - "设计方案必须包含备选方案"
+        - "必须评估技术风险等级"
+
+  - name: "developer"
+    base_skills: ["general-coding", "api-dev", "testing"]
+    overlay:
+      tone: "注重实现效率"
+      constraints:
+        - "禁止自行更改架构决策"
+        - "实现偏离设计时必须先汇报"
+
+  - name: "reviewer"
+    base_skills: ["general-coding", "code-review"]
+    overlay:
+      tone: "建设性批评"
+      constraints:
+        - "必须说明每个问题的严重程度"
+        - "每个问题必须给出修复建议"
+</code></pre>
+
+<p>这个"基础规则 + 角色叠加层"的模式让三个 Agent 终于能协同工作而不互相消耗。</p>
+
+<h2>约束的三个层级</h2>
+
+<p>实际驾驭 Agent 时，约束不是一个扁平列表。我把它分成三个层级：</p>
+
+<p><strong>硬约束（代码级）</strong>：运行时强制执行，Agent 无法绕过。比如文件写入必须在项目目录内（路径校验）、工具调用上限（循环计数器）、敏感信息过滤（正则拦截）。</p>
+
+<pre><code class="language-python">class HardConstraint:
+    """Agent 无法绕过的硬限制"""
+    MAX_TOOL_CALLS = 15
+    ALLOWED_DIRS = {"/workspace", "/tmp"}
+    BANNED_PATTERNS = [r"DROP\s+TABLE", r"rm\s+-rf\s+/"]
+
+    def check(self, tool_name: str, args: dict) -> bool:
+        if tool_name == "write_file":
+            path = Path(args["path"]).resolve()
+            if not any(path.is_relative_to(d) for d in self.ALLOWED_DIRS):
+                raise ConstraintViolation(f"写入路径 {path} 超出允许范围")</code></pre>
+
+<p><strong>软约束（规则级）</strong>：通过 System Prompt 注入，Agent 知道但可以不遵守。比如代码风格偏好、命名约定、文档格式。软约束的价值在于一致性而非强制性。</p>
+
+<p><strong>环境约束（上下文级）</strong>：仅影响当前会话。比如"今天只改 auth 模块"、"本地的 Python 版本是 3.12"。用户可以在对话中动态增减。</p>
+
+<p>三层约束叠加后的效果：Agent 在最外层有环境约束决定"做什么"，中间层有软约束决定"怎么做"，最内层有硬约束保证"不做越界的事"。</p>
+
+<h2>几个实践中的发现</h2>
+
+<p>用了半年规则的 Agent 系统后，几点发现：</p>
+
+<p><strong>规则不是越多越好</strong>。起初我往 SKILL.md 里塞了 50 条规则，Agent 的行为反而变得"犹豫"——它在每条规则之间反复权衡，花大量 token 自我解释。砍到 15 条核心规则后，执行速度翻倍，质量没降。</p>
+
+<p><strong>否定句比肯定句更精确</strong>。"禁止使用 any 类型"比"尽量使用具体类型"更不容易被 Agent 绕过去。Agent 对"尽量""建议"这类模糊词有天然的"发挥空间"。</p>
+
+<p><strong>规则要有"为什么"</strong>。单纯说"禁止在路由中直接写 SQL"，Agent 会在心里把这当成可商量的建议。加上理由——"禁止在路由中直接写 SQL，因为路由不应感知存储实现，这破坏了关注点分离"——Agent 遵守率从 70% 提升到 95%。</p>
+
+<p><strong>审查 Agent 是驾驭体系的安全阀</strong>。即使所有规则都配好了，Agent 仍会在 5% 的场景里偏离预期。加一个独立的审查 Agent——它只读不写，输入是其他 Agent 的输出，输出是"通过"或"未通过 + 原因"——能兜底大多数意外。审查 Agent 的 prompt 很短，就两句话："对照规则清单逐条检查。发现任何偏离立即报告。"</p>
+
+<h2>驾驭工程的边界</h2>
+
+<p>规则和约束能管住 Agent 在已知场景里的行为。但遇到完全陌生的任务时，规则可能完全不适用——Agent 要么被规则束缚无法灵活应对，要么无视规则自行其是。</p>
+
+<p>面对这种情况我的做法是给 Agent 一个"求救"通道：当它判断当前规则不适用于手头任务时，允许它主动反馈"当前规则冲突/不适用，建议关闭以下规则：XXX"，由人类拍板。把"规则不适应"从 Agent 的暗箱决策变成一次显式的人机交互。</p>
+
+<p>驾驭工程的本质不是让 Agent 完全听话，而是在"完全自主"和"完全手动"之间找到那个正确的刻度——不同的团队、不同的项目、不同的阶段，这个刻度不一样。规则体系的价值就在于：它让你可以精确地调节这个刻度，而不是只能在两极之间摇摆。</p>
+  </article>
+  <script src="../assets/js/common.js"></script>
+</body>
+</html>
