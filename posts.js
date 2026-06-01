@@ -1,6 +1,19 @@
 var POSTS_DATA = 
 [
   {
+    "title": "Claude Code 开发实战指南：Superpowers + GStack 插件安装与常用命令",
+    "slug": "2026-06-01-claude-code-development-tutorial",
+    "date": "2026-06-01",
+    "tags": [
+      "Claude Code",
+      "AI编程",
+      "开发工具",
+      "Superpowers",
+      "GStack"
+    ],
+    "summary": "从零开始掌握 Claude Code 开发环境，详解 Superpowers 和 GStack 两大插件的安装配置，以及日常开发中最常用的斜杠命令和工作流。"
+  },
+  {
     "title": "HE 驾驭工程：从 Prompt 到 Agent 系统控制",
     "slug": "2026-03-20-he-steering-engineering",
     "date": "2026-03-20",

@@ -1,0 +1,808 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Claude Code 开发实战指南：Superpowers + GStack 插件安装与常用命令 - HoEndo的技术博客</title>
+  <meta name="article-date" content="2026-06-01">
+  <meta name="article-tags" content="Claude Code,AI编程,开发工具,Superpowers,GStack">
+  <meta name="description" content="从零开始掌握 Claude Code 开发环境，详解 Superpowers 和 GStack 两大插件的安装配置，以及日常开发中最常用的斜杠命令和工作流。">
+</head>
+<body>
+
+  <article class="post-content">
+    <h1>Claude Code 开发实战指南：Superpowers + GStack 插件安装与常用命令</h1>
+
+    <p>Claude Code 是 Anthropic 推出的<strong>终端原生 AI 编程助手</strong>，它不是一个 IDE 插件，而是一个直接运行在终端里的智能代理——能读代码、写代码、执行命令、操作 Git、运行测试，甚至能操作浏览器进行端到端验证。2026 年，围绕 Claude Code 已经形成了一个成熟的插件生态，其中最核心的两个工具是 <strong>Superpowers</strong> 和 <strong>GStack</strong>。</p>
+
+    <p>本文将从零开始，带你完成 Claude Code 的安装配置，并深入讲解 Superpowers 和 GStack 两大插件的使用方法。</p>
+
+    <h2>一、Claude Code 安装</h2>
+
+    <h3>1.1 前置要求</h3>
+
+    <table>
+      <thead>
+        <tr>
+          <th>项目</th>
+          <th>要求</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>操作系统</td>
+          <td>macOS 13+ / Linux / Windows 10+</td>
+        </tr>
+        <tr>
+          <td>账号</td>
+          <td>Claude Pro ($20/月)、Max ($100-200/月) 或 Team/Enterprise</td>
+        </tr>
+        <tr>
+          <td>内存</td>
+          <td>4 GB 起步，8 GB 推荐</td>
+        </tr>
+        <tr>
+          <td>终端</td>
+          <td>Bash / Zsh / PowerShell / CMD</td>
+        </tr>
+        <tr>
+          <td>Git</td>
+          <td>需要（用于代码变更追踪和版本管理）</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <h3>1.2 安装方式</h3>
+
+    <p><strong>方式一：原生安装器（2026 年推荐）</strong></p>
+
+    <p>原生安装器不需要 Node.js，自带自动更新，是目前官方推荐的安装方式。</p>
+
+    <pre><code class="language-bash"># macOS / Linux / WSL
+curl -fsSL https://claude.ai/install.sh | bash
+
+# Windows PowerShell（安装后需将 %USERPROFILE%\.local\bin 加入 PATH）
+irm https://claude.ai/install.ps1 | iex</code></pre>
+
+    <p><strong>方式二：Homebrew（macOS/Linux）</strong></p>
+
+    <pre><code class="language-bash">brew install --cask claude-code</code></pre>
+
+    <p><strong>方式三：WinGet（Windows）</strong></p>
+
+    <pre><code class="language-bash">winget install Anthropic.ClaudeCode</code></pre>
+
+    <p><strong>方式四：npm 安装（兼容路径）</strong></p>
+
+    <p>需要 Node.js 18+。虽然 2026 年起官方推荐原生安装器，但 npm 方式在 CI/CD 流水线、版本锁定、标准化 Node.js 开发环境中仍然实用。</p>
+
+    <pre><code class="language-bash">npm install -g @anthropic-ai/claude-code
+
+# 验证
+claude --version</code></pre>
+
+    <blockquote>
+      <p><strong>注意：</strong>不要使用 <code>sudo npm install -g</code>，会导致文件权限问题。如果之前用 npm 安装过，可以运行 <code>claude install</code> 迁移到原生安装器（保留所有配置），然后 <code>npm uninstall -g @anthropic-ai/claude-code</code> 清理旧包。</p>
+    </blockquote>
+
+    <h3>1.3 VS Code 扩展安装</h3>
+
+    <p>Claude Code 也提供了 <strong>VS Code 官方扩展</strong>，让你在编辑器内直接使用 Claude Code，无需切换终端。</p>
+
+    <p><strong>前提条件：</strong></p>
+    <ul>
+      <li>VS Code 版本 ≥ 1.98.0</li>
+      <li>已安装 Claude Code CLI（按上面的方式任选一种）</li>
+    </ul>
+
+    <p><strong>安装步骤：</strong></p>
+
+    <ol>
+      <li>打开 VS Code，按 <code>Ctrl+Shift+X</code>（Windows/Linux）或 <code>Cmd+Shift+X</code>（Mac）打开扩展面板</li>
+      <li>搜索 <strong>"Claude Code"</strong>，选择发行商为 <strong>Anthropic</strong> 的官方扩展</li>
+      <li>点击 <strong>Install</strong> 安装</li>
+    </ol>
+
+    <p>或者用命令行一键安装：</p>
+
+    <pre><code class="language-bash">code --install-extension anthropic.claude-code</code></pre>
+
+    <p><strong>使用方法：</strong></p>
+
+    <table>
+      <thead>
+        <tr>
+          <th>入口</th>
+          <th>操作</th>
+          <th>适用场景</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>⚡ Spark 图标</td>
+          <td>点击编辑器右上角闪电图标</td>
+          <td>快速提问当前文件</td>
+        </tr>
+        <tr>
+          <td>状态栏</td>
+          <td>点击底部右下角 ✱ Claude Code</td>
+          <td>无需打开文件也能对话</td>
+        </tr>
+        <tr>
+          <td>命令面板</td>
+          <td><code>Cmd+Shift+P</code> → "Claude Code: Open in New Tab"</td>
+          <td>独立对话窗口</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <blockquote>
+      <p><strong>提示：</strong>如果安装后 Spark 图标不显示，打开一个文件（仅打开文件夹不够），确认 VS Code ≥ 1.98.0，然后运行 <code>Developer: Reload Window</code> 刷新窗口。</p>
+    </blockquote>
+
+    <h3>1.4 验证安装与认证</h3>
+
+    <pre><code class="language-bash"># 验证安装
+claude --version
+
+# 健康检查
+claude doctor
+
+# 启动 Claude Code（首次运行会打开浏览器进行 OAuth 认证）
+cd /path/to/your/project
+claude</code></pre>
+
+    <p>启动后，在 Claude Code 交互终端中运行 <code>/init</code> 命令，它会自动分析项目结构并生成 <code>CLAUDE.md</code> 文件。这个文件是 Claude Code 理解你项目的"说明书"，质量越高，AI 的输出越精准。</p>
+
+    <h2>二、Superpowers 插件</h2>
+
+    <p><strong>Superpowers</strong>（GitHub: <a href="https://github.com/obra/superpowers" target="_blank" rel="noopener">obra/superpowers</a>，⭐ 149K+）由 Jesse Vincent 创建，核心理念是 <strong>"Process over Prompt"（流程大于提示词）</strong>。它不是让 AI 变聪明，而是强制 AI 遵循软件工程最佳实践：先想清楚再动手、先写测试再写代码、每个任务独立审查。</p>
+
+    <h3>2.1 安装 Superpowers</h3>
+
+    <p><strong>方式一：通过 Claude Code 插件市场（推荐）</strong></p>
+
+    <pre><code class="language-bash"># 在 Claude Code 会话中执行
+/plugin install superpowers@claude-plugins-official</code></pre>
+
+    <p><strong>方式二：通过 Superpowers 自有市场</strong></p>
+
+    <pre><code class="language-bash">/plugin marketplace add obra/superpowers-marketplace
+/plugin install superpowers@superpowers-marketplace</code></pre>
+
+    <p><strong>方式三：npm 全局安装（跨工具）</strong></p>
+
+    <pre><code class="language-bash">npm install -g superpowers-openspec-team
+sot init /path/to/your/project --tool claude-code</code></pre>
+
+    <h3>2.2 验证安装</h3>
+
+    <p>重启 Claude Code 后，随便提一个开发需求（比如"帮我做一个用户登录功能"），如果 AI 先进入提问模式而不是直接写代码，说明 Superpowers 已生效。</p>
+
+    <p>你也可以用以下命令确认：</p>
+
+    <pre><code class="language-bash">/superpowers:brainstorm</code></pre>
+
+    <h3>2.3 核心技能一览</h3>
+
+    <table>
+      <thead>
+        <tr>
+          <th>技能</th>
+          <th>命令</th>
+          <th>作用</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>需求细化</td>
+          <td><code>/superpowers:brainstorming</code></td>
+          <td>编码前的苏格拉底式提问，理清边界与约束</td>
+        </tr>
+        <tr>
+          <td>制定计划</td>
+          <td><code>/superpowers:writing-plans</code></td>
+          <td>生成详细实现计划，精确到文件路径</td>
+        </tr>
+        <tr>
+          <td>执行计划</td>
+          <td><code>/superpowers:executing-plans</code></td>
+          <td>按计划批量执行，支持人类检查点</td>
+        </tr>
+        <tr>
+          <td>TDD 开发</td>
+          <td>自动触发</td>
+          <td>红-绿-重构循环，强制先写失败测试再写代码</td>
+        </tr>
+        <tr>
+          <td>系统化调试</td>
+          <td><code>/superpowers:systematic-debugging</code></td>
+          <td>4 阶段调试：现象→假设→实验→验证</td>
+        </tr>
+        <tr>
+          <td>并行子代理</td>
+          <td><code>/superpowers:dispatching-parallel-agents</code></td>
+          <td>多子 Agent 并行执行独立任务</td>
+        </tr>
+        <tr>
+          <td>子代理开发</td>
+          <td><code>/superpowers:subagent-driven-development</code></td>
+          <td>每任务派发干净上下文子代理，双阶段审查</td>
+        </tr>
+        <tr>
+          <td>代码审查</td>
+          <td><code>/superpowers:requesting-code-review</code></td>
+          <td>多维度审查（Critical/Warning/Info）</td>
+        </tr>
+        <tr>
+          <td>Git Worktree</td>
+          <td><code>/superpowers:using-git-worktrees</code></td>
+          <td>隔离 Git Worktree 环境，并行开发互不干扰</td>
+        </tr>
+        <tr>
+          <td>分支收尾</td>
+          <td><code>/superpowers:finishing-a-development-branch</code></td>
+          <td>完成后自动跑测试、生成 Review 总结</td>
+        </tr>
+        <tr>
+          <td>完成验证</td>
+          <td><code>/superpowers:verification-before-completion</code></td>
+          <td>任务完成前强制验证，确保功能可用</td>
+        </tr>
+        <tr>
+          <td>自定义技能</td>
+          <td><code>/superpowers:writing-skills</code></td>
+          <td>创建团队专属技能文件（元技能）</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <h3>2.4 标准开发流程</h3>
+
+    <p>使用 Superpowers 后，你的开发流程会从"随口一说就开始写"变成这样：</p>
+
+    <ol>
+      <li><strong>brainstorming</strong> → AI 通过提问理清需求、边界、技术约束</li>
+      <li><strong>writing-plans</strong> → 生成实现计划：文件列表、依赖关系、任务拆分</li>
+      <li><strong>人工审阅计划</strong> → 在你的确认之前 AI 不会动手写代码</li>
+      <li><strong>executing-plans</strong> → 自动分发给子 Agent，每个 Agent 严格遵循 TDD</li>
+      <li><strong>verification + code review</strong> → 自动跑测试 + 最终审查</li>
+      <li><strong>finishing-a-development-branch</strong> → 清理收尾</li>
+    </ol>
+
+    <blockquote>
+      <p>简单任务（改文案、修 typo）可以跳过完整流程，但功能开发和 Bug 修复建议严格遵循。</p>
+    </blockquote>
+
+    <h2>三、GStack 插件</h2>
+
+    <p><strong>GStack</strong>（GitHub: <a href="https://github.com/garrytan/gstack" target="_blank" rel="noopener">garrytan/gstack</a>，⭐ 71K+）由 Y Combinator CEO Garry Tan 创建。如果 Superpowers 是"大脑"（管你怎么想），GStack 就是"双手"（管你怎么干）。它把 Claude Code 变成一个<strong>包含 23+ 角色的虚拟工程团队</strong>：有 CEO 做产品评审、有设计师做 UI 审查、有 QA 做浏览器测试、有运维做部署发布。</p>
+
+    <h3>3.1 安装 GStack</h3>
+
+    <p>GStack 依赖 <strong>Bun</strong>（推荐）或 Node.js，请先确保已安装。</p>
+
+    <pre><code class="language-bash"># 全局安装（推荐，所有项目可用）
+git clone https://github.com/garrytan/gstack.git ~/.claude/skills/gstack
+cd ~/.claude/skills/gstack
+./setup</code></pre>
+
+    <p>安装完成后重启 Claude Code，GStack 的 23+ 个斜杠命令会自动生效。</p>
+
+    <h3>3.2 升级 GStack</h3>
+
+    <pre><code class="language-bash"># 方法一：命令行升级
+cd ~/.claude/skills/gstack
+git fetch origin && git reset --hard origin/main && bash ./setup
+
+# 方法二：内置命令升级
+/gstack-upgrade</code></pre>
+
+    <h3>3.3 核心命令速览</h3>
+
+    <p><strong>产品与规划</strong></p>
+
+    <table>
+      <thead>
+        <tr>
+          <th>命令</th>
+          <th>角色</th>
+          <th>用途</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><code>/office-hours</code></td>
+          <td>产品头脑风暴</td>
+          <td>在写代码前重新审视想法，YC 风格的产品验证</td>
+        </tr>
+        <tr>
+          <td><code>/plan-ceo-review</code></td>
+          <td>CEO / 产品战略</td>
+          <td>战略审查、需求优先级排序</td>
+        </tr>
+        <tr>
+          <td><code>/plan-eng-review</code></td>
+          <td>工程经理</td>
+          <td>架构审查、数据流、测试策略</td>
+        </tr>
+        <tr>
+          <td><code>/plan-design-review</code></td>
+          <td>设计评审</td>
+          <td>UI/UX 评分（0-10）与优化建议</td>
+        </tr>
+        <tr>
+          <td><code>/autoplan</code></td>
+          <td>自动规划</td>
+          <td>一键串联 CEO→设计→工程评审全流程</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <p><strong>开发与审查</strong></p>
+
+    <table>
+      <thead>
+        <tr>
+          <th>命令</th>
+          <th>角色</th>
+          <th>用途</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><code>/review</code></td>
+          <td>代码审查员</td>
+          <td>偏执级审查：竞态条件、N+1 查询、安全漏洞、边界情况</td>
+        </tr>
+        <tr>
+          <td><code>/qa</code></td>
+          <td>QA 工程师</td>
+          <td>分析 git diff，识别影响范围，运行自动化测试</td>
+        </tr>
+        <tr>
+          <td><code>/qa-only</code></td>
+          <td>QA（仅报告）</td>
+          <td>只报 Bug，不自动修复</td>
+        </tr>
+        <tr>
+          <td><code>/investigate</code></td>
+          <td>调试专家</td>
+          <td>系统化根因分析（只调查，不动代码）</td>
+        </tr>
+        <tr>
+          <td><code>/cso</code></td>
+          <td>安全审计</td>
+          <td>OWASP + STRIDE 威胁模型审查</td>
+        </tr>
+        <tr>
+          <td><code>/codex</code></td>
+          <td>第二意见</td>
+          <td>调用 OpenAI Codex 进行独立审查</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <p><strong>部署与运维</strong></p>
+
+    <table>
+      <thead>
+        <tr>
+          <th>命令</th>
+          <th>角色</th>
+          <th>用途</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><code>/ship</code></td>
+          <td>发布经理</td>
+          <td>同步主分支、跑测试、创建 PR，一键发布</td>
+        </tr>
+        <tr>
+          <td><code>/land-and-deploy</code></td>
+          <td>DevOps</td>
+          <td>合并 PR、等待 CI、部署、验证</td>
+        </tr>
+        <tr>
+          <td><code>/canary</code></td>
+          <td>灰度发布</td>
+          <td>金丝雀部署与监控</td>
+        </tr>
+        <tr>
+          <td><code>/document-release</code></td>
+          <td>文档工程师</td>
+          <td>发布后同步所有文档</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <p><strong>浏览器与测试</strong></p>
+
+    <table>
+      <thead>
+        <tr>
+          <th>命令</th>
+          <th>用途</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><code>/browse</code></td>
+          <td>无头浏览器自动化：导航、点击、填表、截图、控制台/网络检查</td>
+        </tr>
+        <tr>
+          <td><code>/setup-browser-cookies</code></td>
+          <td>导入本地浏览器 Cookie，绕过复杂登录流程</td>
+        </tr>
+        <tr>
+          <td><code>/benchmark</code></td>
+          <td>页面加载时间和资源性能基准测试</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <p><strong>安全与约束</strong></p>
+
+    <table>
+      <thead>
+        <tr>
+          <th>命令</th>
+          <th>用途</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><code>/careful</code></td>
+          <td>危险操作前警告（rm -rf、DROP TABLE、force-push）</td>
+        </tr>
+        <tr>
+          <td><code>/freeze &lt;dir&gt;</code></td>
+          <td>限制编辑范围到指定目录</td>
+        </tr>
+        <tr>
+          <td><code>/guard</code></td>
+          <td>安全最大化，组合 careful + freeze</td>
+        </tr>
+        <tr>
+          <td><code>/unfreeze</code></td>
+          <td>解除目录限制</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <h3>3.4 典型工作流</h3>
+
+    <p><strong>新功能开发（全流程）：</strong></p>
+
+    <pre><code class="language-bash">/office-hours          # 1. 产品头脑风暴
+/autoplan              # 2. CEO→设计→工程自动审查
+# ... 编写代码 ...
+/review                # 3. 偏执级代码审查
+/qa                    # 4. 自动化 QA 测试
+/ship                  # 5. 创建 PR 并发布
+/document-release      # 6. 更新文档</code></pre>
+
+    <p><strong>Bug 修复：</strong></p>
+
+    <pre><code class="language-bash">/investigate           # 1. 根因分析（只读）
+# ... 应用修复 ...
+/qa                    # 2. 验证修复
+/ship                  # 3. 发布</code></pre>
+
+    <h2>四、Claude Code 常用内置命令</h2>
+
+    <p>除了插件提供的命令，Claude Code 自身也内置了大量实用命令。</p>
+
+    <h3>4.1 会话管理</h3>
+
+    <table>
+      <thead>
+        <tr>
+          <th>命令</th>
+          <th>作用</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><code>/clear</code></td>
+          <td>清空对话历史，重新开始</td>
+        </tr>
+        <tr>
+          <td><code>/compact</code></td>
+          <td>智能压缩上下文（保留关键信息，释放 token）</td>
+        </tr>
+        <tr>
+          <td><code>/resume</code></td>
+          <td>恢复之前的会话</td>
+        </tr>
+        <tr>
+          <td><code>/rename</code></td>
+          <td>给当前会话命名</td>
+        </tr>
+        <tr>
+          <td><code>/branch</code></td>
+          <td>分叉会话（探索替代方案而不丢失当前状态）</td>
+        </tr>
+        <tr>
+          <td><code>/export</code></td>
+          <td>导出对话历史</td>
+        </tr>
+        <tr>
+          <td><code>/recap</code></td>
+          <td>一句话会话摘要，快速恢复上下文</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <h3>4.2 上下文与成本</h3>
+
+    <table>
+      <thead>
+        <tr>
+          <th>命令</th>
+          <th>作用</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><code>/context</code></td>
+          <td>查看上下文窗口使用情况（系统提示、文件、历史等详细分布）</td>
+        </tr>
+        <tr>
+          <td><code>/cost</code></td>
+          <td>查看当前会话的 token 消耗和费用</td>
+        </tr>
+        <tr>
+          <td><code>/status</code></td>
+          <td>完整会话状态 + 上下文使用百分比</td>
+        </tr>
+        <tr>
+          <td><code>/usage</code></td>
+          <td>账户级别配额使用情况</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <h3>4.3 模式与模型</h3>
+
+    <table>
+      <thead>
+        <tr>
+          <th>命令</th>
+          <th>作用</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><code>/model</code></td>
+          <td>切换模型（Sonnet / Opus / Haiku）</td>
+        </tr>
+        <tr>
+          <td><code>/effort</code></td>
+          <td>设置推理深度：low / medium / high / xhigh / max / auto</td>
+        </tr>
+        <tr>
+          <td><code>/plan</code></td>
+          <td>进入规划模式（只读探索，不修改文件）</td>
+        </tr>
+        <tr>
+          <td><code>/execute</code></td>
+          <td>退出规划模式，开始执行修改</td>
+        </tr>
+        <tr>
+          <td><code>/fast</code></td>
+          <td>切换高速模式（约 2.5x 速度，成本更高）</td>
+        </tr>
+        <tr>
+          <td><code>/sandbox</code></td>
+          <td>启用 OS 级沙箱隔离（文件系统 + 网络 + 进程）</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <h3>4.4 开发与自动化</h3>
+
+    <table>
+      <thead>
+        <tr>
+          <th>命令</th>
+          <th>作用</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><code>/init</code></td>
+          <td>初始化项目 CLAUDE.md 文件</td>
+        </tr>
+        <tr>
+          <td><code>/diff</code></td>
+          <td>交互式查看未提交的代码变更</td>
+        </tr>
+        <tr>
+          <td><code>/commit</code></td>
+          <td>暂存并提交，自动生成 commit 信息</td>
+        </tr>
+        <tr>
+          <td><code>/review</code></td>
+          <td>对当前变更进行代码审查</td>
+        </tr>
+        <tr>
+          <td><code>/security-review</code></td>
+          <td>扫描未提交变更中的安全漏洞</td>
+        </tr>
+        <tr>
+          <td><code>/batch</code></td>
+          <td>大规模并行重构（派发 5-30 个子 Agent）</td>
+        </tr>
+        <tr>
+          <td><code>/loop</code></td>
+          <td>定时重复执行（如 /loop 5m check deploy）</td>
+        </tr>
+        <tr>
+          <td><code>/tasks</code></td>
+          <td>监控后台任务和子 Agent</td>
+        </tr>
+        <tr>
+          <td><code>/debug</code></td>
+          <td>启动调试日志并分析</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <h3>4.5 配置与环境</h3>
+
+    <table>
+      <thead>
+        <tr>
+          <th>命令</th>
+          <th>作用</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><code>/config</code></td>
+          <td>打开设置界面（主题、模型、输出风格）</td>
+        </tr>
+        <tr>
+          <td><code>/permissions</code></td>
+          <td>管理工具和文件权限</td>
+        </tr>
+        <tr>
+          <td><code>/add-dir</code></td>
+          <td>添加额外工作目录</td>
+        </tr>
+        <tr>
+          <td><code>/plugin</code></td>
+          <td>安装/管理插件</td>
+        </tr>
+        <tr>
+          <td><code>/skills</code></td>
+          <td>查看和搜索已安装的技能</td>
+        </tr>
+        <tr>
+          <td><code>/mcp</code></td>
+          <td>管理 MCP 服务器连接</td>
+        </tr>
+        <tr>
+          <td><code>/hooks</code></td>
+          <td>管理事件钩子</td>
+        </tr>
+        <tr>
+          <td><code>/doctor</code></td>
+          <td>系统健康检查和依赖验证</td>
+        </tr>
+        <tr>
+          <td><code>/feedback</code></td>
+          <td>提交 bug 报告或反馈</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <h2>五、Superpowers + GStack 协同工作流</h2>
+
+    <p>这两个工具不是竞品，而是互补关系。Superpowers 管"怎么想"，GStack 管"怎么干"。推荐的协同方式如下：</p>
+
+    <pre><code class="language-text">[需求]
+  ↓ /superpowers:brainstorming     ← "该不该做？怎么做最合理？"
+  ↓ /superpowers:writing-plans      ← "具体方案是什么？"
+  ↓ /office-hours                   ← "从产品视角再审视一遍"
+  ↓ /plan-ceo-review                ← "战略对齐了吗？"
+  ↓ /plan-eng-review                ← "架构合理吗？"
+  ↓ /superpowers:executing-plans    ← "按计划实现（TDD + 子代理）"
+  ↓ /qa  或  /browse                ← "浏览器真实验证"
+  ↓ /superpowers:requesting-code-review ← "独立审查通道"
+  ↓ /review                         ← "偏执级最终检查"
+  ↓ /ship                           ← "一键发布"
+  ↓ /land-and-deploy                ← "合并 + CI + 部署验证"
+[上线]</code></pre>
+
+    <p>实际使用中，你不需要每次都跑完全流程。可以根据任务复杂度灵活调整：</p>
+
+    <ul>
+      <li><strong>简单修改</strong>（修 typo、改样式）：直接改，用 <code>/review</code> 快速检查即可</li>
+      <li><strong>中等功能</strong>（新增 API、重构模块）：brainstorming → writing-plans → 实现 → review → ship</li>
+      <li><strong>大型功能</strong>（新系统、架构变更）：跑完整流程，加上 <code>/autoplan</code> 串联审查</li>
+    </ul>
+
+    <h2>六、实用技巧</h2>
+
+    <h3>6.1 项目级安装 GStack（团队共享）</h3>
+
+    <p>如果想让整个团队都使用 GStack，可以把插件文件提交到项目仓库：</p>
+
+    <pre><code class="language-bash">cp -Rf ~/.claude/skills/gstack .claude/skills/gstack
+rm -rf .claude/skills/gstack/.git
+cd .claude/skills/gstack
+./setup</code></pre>
+
+    <p>这样其他团队成员 clone 项目后就能直接使用 GStack 命令。</p>
+
+    <h3>6.2 自定义斜杠命令</h3>
+
+    <p>Claude Code 支持创建自定义命令，放在两个位置：</p>
+
+    <ul>
+      <li><strong>项目级：</strong><code>.claude/commands/</code>（提交到 Git，团队共享）</li>
+      <li><strong>全局：</strong><code>~/.claude/commands/</code>（个人使用，所有项目可用）</li>
+    </ul>
+
+    <p>例如创建 <code>.claude/commands/deploy.md</code>：</p>
+
+    <pre><code class="language-markdown">部署应用到 $ARGUMENTS 环境。
+1. 运行测试：npm test
+2. 构建：npm run build
+3. 部署：npm run deploy:$ARGUMENTS
+4. 验证健康检查端点
+5. 报告成功或在健康检查失败时回滚</code></pre>
+
+    <p>使用：<code>/deploy staging</code> 或 <code>/deploy production</code></p>
+
+    <p><code>$ARGUMENTS</code> 会捕获命令后面输入的所有参数。</p>
+
+    <h3>6.3 上下文管理</h3>
+
+    <p>长会话的上下文窗口会逐渐占满，影响 AI 输出质量。几个实用技巧：</p>
+
+    <ul>
+      <li>用 <code>/compact</code> 而不是 <code>/clear</code>——compact 会保留关键决策和文件信息，比清空重来高效得多</li>
+      <li>定期用 <code>/context</code> 查看上下文占用情况</li>
+      <li>用 <code>/cost</code> 监控 token 消耗，避免意外超支</li>
+      <li>复杂任务开启前先 <code>/plan</code>，在规划模式下免费探索代码库</li>
+    </ul>
+
+    <h3>6.4 安全开发</h3>
+
+    <ul>
+      <li>不确定的操作用 <code>/plan</code> 模式先探索，确认后再 <code>/execute</code></li>
+      <li>高风险目录用 <code>/freeze &lt;dir&gt;</code> 限制编辑范围</li>
+      <li>上线前用 <code>/cso</code> 做安全审计，<code>/security-review</code> 扫描未提交变更</li>
+      <li>Git 操作前确保有可回滚状态，善用 <code>/branch</code> 分叉探索</li>
+    </ul>
+
+    <h2>总结</h2>
+
+    <p>Claude Code 在 2026 年已经从"终端里的聊天机器人"进化为<strong>完整的 AI 开发平台</strong>。核心公式很简单：</p>
+
+    <blockquote>
+      <p><strong>Claude Code（基座）+ Superpowers（纪律） + GStack（团队） = AI 驱动的完整工程组织</strong></p>
+    </blockquote>
+
+    <p>Superpowers 确保你不会写出烂代码，GStack 确保你不会漏掉产品审查、测试、部署任何一个环节。二者叠加，能把一个独立开发者的产出提升到小团队的水平。</p>
+
+    <p>安装顺序建议：先装 Claude Code → 跑 <code>/init</code> → 装 Superpowers → 装 GStack → 从一个小功能开始，按完整流程走一遍。踩过一遍完整流程后，你就能根据任务复杂度灵活裁剪工作流了。</p>
+
+    <hr>
+
+    <p><strong>参考资源：</strong></p>
+    <ul>
+      <li>Superpowers 仓库：<a href="https://github.com/obra/superpowers" target="_blank" rel="noopener">github.com/obra/superpowers</a></li>
+      <li>GStack 仓库：<a href="https://github.com/garrytan/gstack" target="_blank" rel="noopener">github.com/garrytan/gstack</a></li>
+      <li>Claude Code 官方文档：<a href="https://code.claude.com/docs" target="_blank" rel="noopener">code.claude.com/docs</a></li>
+    </ul>
+  </article>
+
+  <script src="../assets/js/common.js"></script>
+
+</body>
+</html>
