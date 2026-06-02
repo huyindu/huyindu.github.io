@@ -1,0 +1,829 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Hermes Agent 安装配置指南：接入 DeepSeek API 和飞书 - HoEndo的技术博客</title>
+  <meta name="article-date" content="2026-06-02">
+  <meta name="article-tags" content="Hermes Agent,AI编程,DeepSeek,飞书,开发工具">
+  <meta name="description" content="从零安装 Hermes Agent 开源 AI 代理框架，配置 DeepSeek API 作为模型后端，接入飞书实现多平台交互，以及日常开发最常用命令速查。">
+</head>
+<body>
+
+  <article class="post-content">
+    <h1>Hermes Agent 安装配置指南：接入 DeepSeek API 和飞书</h1>
+
+    <p>Hermes Agent 是 Nous Research 开源的一款<strong>终端原生 AI 代理框架</strong>，和 Claude Code、OpenAI Codex 属于同一类别——运行在终端中，通过工具调用与系统交互，能读写文件、执行命令、操作 Git、搜索网页，甚至调度子代理并行工作。不同的是，Hermes 完全<strong>不绑定任何模型供应商</strong>：你可以用 DeepSeek、Anthropic、OpenAI、OpenRouter，或者跑本地模型，同一个 Agent 切换模型不需要改动任何代码。</p>
+
+    <p>本文基于本机实际部署环境（Debian 12，Hermes v0.15.1，DeepSeek V4 Pro，飞书 WebSocket 连接），从安装到生产可用，把每一步的命令和踩坑点都写清楚。</p>
+
+    <h2>一、Hermes Agent 是什么</h2>
+
+    <p>先把几个关键特性列清楚，有个全局认知：</p>
+
+    <table>
+      <thead>
+        <tr>
+          <th>特性</th>
+          <th>说明</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>终端原生</td>
+          <td>直接在 Bash/Zsh 里运行，支持交互式和单次查询两种模式</td>
+        </tr>
+        <tr>
+          <td>模型无关</td>
+          <td>支持 20+ 模型供应商，通过 <code>hermes model</code> 随时切换</td>
+        </tr>
+        <tr>
+          <td>多平台网关</td>
+          <td>同一个 Agent 可通过 Telegram、Discord、飞书、Slack、微信等 15+ 平台交互</td>
+        </tr>
+        <tr>
+          <td>自学习技能</td>
+          <td>完成任务后能把工作流保存为「技能」(Skill)，下次自动加载复用</td>
+        </tr>
+        <tr>
+          <td>持久记忆</td>
+          <td>跨会话记住用户偏好、环境细节、项目约定</td>
+        </tr>
+        <tr>
+          <td>子代理调度</td>
+          <td>通过 <code>delegate_task</code> 并行派发子任务到独立 Worker</td>
+        </tr>
+        <tr>
+          <td>定时任务</td>
+          <td>内置 Cron 调度器，支持按表达式或自然语言安排周期任务</td>
+        </tr>
+        <tr>
+          <td>多配置文件</td>
+          <td>Profile 机制支持多套独立配置（不同项目、不同模型）</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <h2>二、安装 Hermes</h2>
+
+    <h3>2.1 前置要求</h3>
+
+    <table>
+      <thead>
+        <tr>
+          <th>项目</th>
+          <th>要求</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>操作系统</td>
+          <td>Linux / macOS / Windows (WSL)</td>
+        </tr>
+        <tr>
+          <td>Python</td>
+          <td>3.11+</td>
+        </tr>
+        <tr>
+          <td>Git</td>
+          <td>2.30+</td>
+        </tr>
+        <tr>
+          <td>网络</td>
+          <td>需访问 GitHub 和 DeepSeek API（国内需代理）</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <blockquote>
+      <p><strong>国内网络提醒：</strong>DeepSeek API 国内可直接访问，但 GitHub 和 PyPI 可能需要代理或镜像。如果遇到下载慢的情况，可以设置 pip 清华镜像：<code>pip install -i https://pypi.tuna.tsinghua.edu.cn/simple &lt;package&gt;</code>，或配置 HTTP 代理：<code>export ALL_PROXY=socks5h://127.0.0.1:10808</code>。</p>
+    </blockquote>
+
+    <h3>2.2 方式一：一键安装脚本（推荐）</h3>
+
+    <pre><code class="language-bash">curl -fsSL https://raw.githubusercontent.com/NousResearch/hermes-agent/main/scripts/install.sh | bash</code></pre>
+
+    <p>脚本会自动完成：创建虚拟环境、安装依赖、配置 PATH。安装完成后验证：</p>
+
+    <pre><code class="language-bash">hermes --version
+# 输出: Hermes Agent v0.15.1</code></pre>
+
+    <h3>2.3 方式二：从源码安装</h3>
+
+    <p>如果你需要修改源码或使用开发中的特性，可以从 GitHub 克隆：</p>
+
+    <pre><code class="language-bash">git clone https://github.com/NousResearch/hermes-agent.git ~/hermes-agent
+cd ~/hermes-agent
+python -m venv venv
+source venv/bin/activate
+pip install -e .
+
+# 添加到 PATH
+ln -s ~/hermes-agent/venv/bin/hermes ~/.local/bin/hermes</code></pre>
+
+    <p>本机实际部署用的就是源码安装方式，方便随时 <code>git pull</code> 更新。</p>
+
+    <h3>2.4 初始化配置</h3>
+
+    <p>安装完成后运行配置向导：</p>
+
+    <pre><code class="language-bash">hermes setup</code></pre>
+
+    <p>这会交互式引导你完成模型、终端、网关等核心配置。配置文件存放位置：</p>
+
+    <table>
+      <thead>
+        <tr>
+          <th>文件</th>
+          <th>路径</th>
+          <th>用途</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>主配置</td>
+          <td><code>~/.hermes/config.yaml</code></td>
+          <td>模型、工具、代理行为等所有设置</td>
+        </tr>
+        <tr>
+          <td>环境变量</td>
+          <td><code>~/.hermes/.env</code></td>
+          <td>API Key、密钥等敏感信息</td>
+        </tr>
+        <tr>
+          <td>技能目录</td>
+          <td><code>~/.hermes/skills/</code></td>
+          <td>已安装的技能文件</td>
+        </tr>
+        <tr>
+          <td>会话存储</td>
+          <td><code>~/.hermes/state.db</code></td>
+          <td>SQLite 会话历史（FTS5 全文索引）</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <h2>三、接入 DeepSeek API</h2>
+
+    <p>DeepSeek 是目前性价比最高的 API 之一，国内直接访问，延迟低。Hermes 原生支持 DeepSeek provider，配置只需要两步。</p>
+
+    <h3>3.1 获取 API Key</h3>
+
+    <p>访问 <a href="https://platform.deepseek.com/api_keys" target="_blank" rel="noopener">platform.deepseek.com/api_keys</a> 创建 API Key。新用户注册一般有免费额度。</p>
+
+    <h3>3.2 配置 API Key</h3>
+
+    <p>编辑 <code>~/.hermes/.env</code>，添加：</p>
+
+    <pre><code class="language-bash">DEEPSEEK_API_KEY=sk-xxx...</code></pre>
+
+    <p>也可以用 <code>hermes auth add deepseek</code> 交互式输入。</p>
+
+    <h3>3.3 配置模型</h3>
+
+    <p>编辑 <code>~/.hermes/config.yaml</code>，设置 model 段：</p>
+
+    <pre><code class="language-yaml">model:
+  default: deepseek-v4-pro       # 默认模型
+  provider: deepseek             # 供应商
+  base_url: https://api.deepseek.com/v1  # API 地址</code></pre>
+
+    <p>也可以用交互式命令切换：</p>
+
+    <pre><code class="language-bash">hermes model    # 打开模型选择器，选 deepseek → deepseek-v4-pro</code></pre>
+
+    <h3>3.4 验证</h3>
+
+    <pre><code class="language-bash">hermes chat -q "简单介绍一下你自己"
+# 应该收到 DeepSeek 模型的回复</code></pre>
+
+    <p>如果想临时覆盖模型（不修改默认配置）：</p>
+
+    <pre><code class="language-bash">hermes chat -q "..." -m deepseek-v4-pro --provider deepseek</code></pre>
+
+    <h3>3.5 支持的其他 DeepSeek 模型</h3>
+
+    <table>
+      <thead>
+        <tr>
+          <th>模型</th>
+          <th>特点</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><code>deepseek-v4-pro</code></td>
+          <td>最新旗舰，综合能力最强</td>
+        </tr>
+        <tr>
+          <td><code>deepseek-chat</code></td>
+          <td>V3 系列，高性价比通用模型</td>
+        </tr>
+        <tr>
+          <td><code>deepseek-reasoner</code></td>
+          <td>R1 系列，深度推理</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <h2>四、接入飞书</h2>
+
+    <p>Hermes 的 Gateway 模块支持 15+ 消息平台，包括飞书。接入后可以直接在飞书群里 @机器人 发指令，Hermes 会在终端执行并返回结果。</p>
+
+    <h3>4.1 创建飞书应用</h3>
+
+    <ol>
+      <li>打开 <a href="https://open.feishu.cn/app" target="_blank" rel="noopener">飞书开放平台</a></li>
+      <li>创建企业自建应用，填写应用名称和描述</li>
+      <li>在「添加应用能力」中添加「机器人」</li>
+      <li>在「权限管理」中搜索并开启以下权限：
+        <ul>
+          <li><code>im:message</code> — 获取与发送消息</li>
+          <li><code>im:message.group_at_msg</code> — 读取群 @ 消息</li>
+          <li><code>im:message.p2p_msg</code> — 读取单聊消息</li>
+          <li><code>im:resource</code> — 获取消息中的文件资源</li>
+        </ul>
+      </li>
+      <li>在「安全设置」中配置 IP 白名单（或留空允许所有 IP）</li>
+      <li>发布应用，等待管理员审批</li>
+    </ol>
+
+    <h3>4.2 获取凭证</h3>
+
+    <p>在飞书开放平台「凭证与基础信息」页面，复制以下信息：</p>
+
+    <ul>
+      <li><strong>App ID</strong> — 应用唯一标识</li>
+      <li><strong>App Secret</strong> — 应用密钥（只显示一次，复制后妥善保存）</li>
+    </ul>
+
+    <h3>4.3 安装 lark-oapi SDK</h3>
+
+    <p>飞书适配器依赖 <code>lark-oapi</code>。进入 Hermes 的虚拟环境安装：</p>
+
+    <pre><code class="language-bash"># 源码安装的：激活 venv
+source ~/hermes-agent/venv/bin/activate
+pip install lark-oapi
+
+# 如果用的 PyPI 清华镜像
+pip install -i https://pypi.tuna.tsinghua.edu.cn/simple lark-oapi</code></pre>
+
+    <p>安装完成后验证：</p>
+
+    <pre><code class="language-bash">python -c "import lark_oapi; print('OK')"</code></pre>
+
+    <h3>4.4 配置环境变量</h3>
+
+    <p>编辑 <code>~/.hermes/.env</code>，添加以下配置：</p>
+
+    <pre><code class="language-bash"># 飞书应用凭证（必填）
+FEISHU_APP_ID=cli_xxxxxxxxxxxxxxxx
+FEISHU_APP_SECRET=你的AppSecret
+
+# 飞书环境类型
+FEISHU_DOMAIN=feishu            # 飞书用 feishu，Lark 国际版用 lark
+
+# 连接方式
+FEISHU_CONNECTION_MODE=websocket  # WebSocket 长连接，推荐
+
+# 权限控制
+FEISHU_ALLOW_ALL_USERS=true     # true: 允许所有用户，false: 只允许白名单
+FEISHU_ALLOWED_USERS=           # 白名单用户 ID（逗号分隔），为空表示不限制
+FEISHU_GROUP_POLICY=open        # 群聊策略: open(任何人可加群) 或 private(仅群主可加)</code></pre>
+
+    <blockquote>
+      <p><strong>踩坑记录：</strong>本机初次部署时，Gateway 日志报 <code>lark-oapi not installed or FEISHU_APP_ID/SECRET not set</code>。原因是只在系统 Python 环境装了 lark-oapi，而 Hermes 的 systemd 服务运行在它自己的 venv 里。解决方法：激活 Hermes 的 venv 再装 lark-oapi，或者用 <code>sudo hermes gateway restart --system</code> 之前确认 <code>which python</code> 指向正确的 venv。</p>
+    </blockquote>
+
+    <h3>4.5 启动 Gateway</h3>
+
+    <pre><code class="language-bash"># 前台运行（测试用）
+hermes gateway run
+
+# 安装为系统服务（生产用，开机自启）
+sudo hermes gateway install
+sudo systemctl status hermes-gateway
+
+# 管理服务
+sudo hermes gateway restart
+sudo hermes gateway stop
+sudo hermes gateway status</code></pre>
+
+    <p>服务启动后，日志位置：</p>
+
+    <pre><code class="language-bash">grep -i "feishu\|error" ~/.hermes/logs/gateway.log | tail -20</code></pre>
+
+    <h3>4.6 在飞书中使用</h3>
+
+    <p>Gateway 启动成功后：</p>
+
+    <ul>
+      <li><strong>单聊：</strong>在飞书中直接搜索你的应用名称，开始对话</li>
+      <li><strong>群聊：</strong>把应用添加到群组，@机器人 + 消息即可触发</li>
+      <li><strong>安全机制：</strong>终端执行的命令会先推送到飞书等待审批（Gateway 模式下默认 <code>approvals.mode: manual</code>）</li>
+    </ul>
+
+    <p>飞书中支持的常用交互：</p>
+
+    <ul>
+      <li><code>/approve</code> — 审批待执行的命令</li>
+      <li><code>/deny</code> — 拒绝待执行的命令</li>
+      <li><code>/sethome</code> — 将当前聊天设为主频道</li>
+      <li><code>/restart</code> — 重启 Gateway</li>
+      <li><code>/status</code> — 查看会话信息</li>
+      <li><code>/model [name]</code> — 查看或切换模型</li>
+      <li><code>/config</code> — 查看当前配置</li>
+    </ul>
+
+    <blockquote>
+      <p><strong>提示：</strong>如果 Gateway 在 SSH 断开后停止，需要启用 systemd linger：<code>sudo loginctl enable-linger $USER</code>。</p>
+    </blockquote>
+
+    <h2>五、常用命令速查</h2>
+
+    <p>以下命令涵盖日常使用 90% 的场景。所有命令都可以用 <code>hermes --help</code> 查看完整列表。</p>
+
+    <h3>5.1 聊天与会话</h3>
+
+    <table>
+      <thead>
+        <tr>
+          <th>命令</th>
+          <th>说明</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><code>hermes</code></td>
+          <td>进入交互式聊天</td>
+        </tr>
+        <tr>
+          <td><code>hermes chat -q "问题"</code></td>
+          <td>单次查询，不进入交互模式</td>
+        </tr>
+        <tr>
+          <td><code>hermes -c</code></td>
+          <td>恢复最近一次会话</td>
+        </tr>
+        <tr>
+          <td><code>hermes -r "标题"</code></td>
+          <td>按标题恢复指定会话</td>
+        </tr>
+        <tr>
+          <td><code>hermes sessions list</code></td>
+          <td>列出所有会话</td>
+        </tr>
+        <tr>
+          <td><code>hermes sessions browse</code></td>
+          <td>交互式浏览会话</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <h3>5.2 模型与配置</h3>
+
+    <table>
+      <thead>
+        <tr>
+          <th>命令</th>
+          <th>说明</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><code>hermes model</code></td>
+          <td>交互式选择模型</td>
+        </tr>
+        <tr>
+          <td><code>hermes config</code></td>
+          <td>查看当前配置</td>
+        </tr>
+        <tr>
+          <td><code>hermes config edit</code></td>
+          <td>编辑 config.yaml</td>
+        </tr>
+        <tr>
+          <td><code>hermes config set KEY VALUE</code></td>
+          <td>设置配置项</td>
+        </tr>
+        <tr>
+          <td><code>hermes config path</code></td>
+          <td>打印 config.yaml 路径</td>
+        </tr>
+        <tr>
+          <td><code>hermes doctor</code></td>
+          <td>检查环境和依赖</td>
+        </tr>
+        <tr>
+          <td><code>hermes auth list</code></td>
+          <td>列出已存储的凭证</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <h3>5.3 工具管理</h3>
+
+    <table>
+      <thead>
+        <tr>
+          <th>命令</th>
+          <th>说明</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><code>hermes tools</code></td>
+          <td>交互式启用/禁用工具（Curses UI）</td>
+        </tr>
+        <tr>
+          <td><code>hermes tools list</code></td>
+          <td>列出所有工具及状态</td>
+        </tr>
+        <tr>
+          <td><code>hermes tools enable NAME</code></td>
+          <td>启用某个工具集</td>
+        </tr>
+        <tr>
+          <td><code>hermes tools disable NAME</code></td>
+          <td>禁用某个工具集</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <h3>5.4 技能管理</h3>
+
+    <table>
+      <thead>
+        <tr>
+          <th>命令</th>
+          <th>说明</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><code>hermes skills list</code></td>
+          <td>列出已安装的技能</td>
+        </tr>
+        <tr>
+          <td><code>hermes skills search KEYWORD</code></td>
+          <td>搜索技能市场</td>
+        </tr>
+        <tr>
+          <td><code>hermes skills install ID</code></td>
+          <td>安装技能（ID 或 URL）</td>
+        </tr>
+        <tr>
+          <td><code>hermes skills uninstall NAME</code></td>
+          <td>卸载技能</td>
+        </tr>
+        <tr>
+          <td><code>hermes skills check</code></td>
+          <td>检查技能更新</td>
+        </tr>
+        <tr>
+          <td><code>hermes -s skill1,skill2</code></td>
+          <td>启动时预加载指定技能</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <h3>5.5 Gateway 管理</h3>
+
+    <table>
+      <thead>
+        <tr>
+          <th>命令</th>
+          <th>说明</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><code>hermes gateway run</code></td>
+          <td>前台运行 Gateway</td>
+        </tr>
+        <tr>
+          <td><code>hermes gateway install</code></td>
+          <td>安装为系统服务</td>
+        </tr>
+        <tr>
+          <td><code>hermes gateway start</code></td>
+          <td>启动服务</td>
+        </tr>
+        <tr>
+          <td><code>hermes gateway stop</code></td>
+          <td>停止服务</td>
+        </tr>
+        <tr>
+          <td><code>hermes gateway restart</code></td>
+          <td>重启服务</td>
+        </tr>
+        <tr>
+          <td><code>hermes gateway status</code></td>
+          <td>查看运行状态</td>
+        </tr>
+        <tr>
+          <td><code>hermes gateway setup</code></td>
+          <td>配置平台接入</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <h3>5.6 Profiles（多环境）</h3>
+
+    <table>
+      <thead>
+        <tr>
+          <th>命令</th>
+          <th>说明</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><code>hermes profile list</code></td>
+          <td>列出所有 Profile</td>
+        </tr>
+        <tr>
+          <td><code>hermes profile create NAME</code></td>
+          <td>创建新 Profile</td>
+        </tr>
+        <tr>
+          <td><code>hermes profile use NAME</code></td>
+          <td>切换默认 Profile</td>
+        </tr>
+        <tr>
+          <td><code>hermes profile delete NAME</code></td>
+          <td>删除 Profile</td>
+        </tr>
+        <tr>
+          <td><code>hermes -p NAME</code></td>
+          <td>临时使用某个 Profile</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <h3>5.7 定时任务（Cron）</h3>
+
+    <table>
+      <thead>
+        <tr>
+          <th>命令</th>
+          <th>说明</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><code>hermes cron list</code></td>
+          <td>列出所有定时任务</td>
+        </tr>
+        <tr>
+          <td><code>hermes cron create "0 9 * * *"</code></td>
+          <td>创建 cron 表达式任务</td>
+        </tr>
+        <tr>
+          <td><code>hermes cron create "every 2h"</code></td>
+          <td>创建周期任务</td>
+        </tr>
+        <tr>
+          <td><code>hermes cron pause ID</code></td>
+          <td>暂停任务</td>
+        </tr>
+        <tr>
+          <td><code>hermes cron resume ID</code></td>
+          <td>恢复任务</td>
+        </tr>
+        <tr>
+          <td><code>hermes cron remove ID</code></td>
+          <td>删除任务</td>
+        </tr>
+        <tr>
+          <td><code>hermes cron run ID</code></td>
+          <td>手动触发一次</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <h3>5.8 更新与维护</h3>
+
+    <table>
+      <thead>
+        <tr>
+          <th>命令</th>
+          <th>说明</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><code>hermes update</code></td>
+          <td>更新到最新版本</td>
+        </tr>
+        <tr>
+          <td><code>hermes doctor --fix</code></td>
+          <td>自动修复配置问题</td>
+        </tr>
+        <tr>
+          <td><code>hermes config check</code></td>
+          <td>检查缺失的配置项</td>
+        </tr>
+        <tr>
+          <td><code>hermes config migrate</code></td>
+          <td>将旧配置迁移到新格式</td>
+        </tr>
+        <tr>
+          <td><code>hermes skills update</code></td>
+          <td>更新过时的技能</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <h2>六、交互式会话常用斜杠命令</h2>
+
+    <p>在 <code>hermes</code> 交互会话中，输入 <code>/</code> 开头的命令可以直接控制会话行为。</p>
+
+    <h3>6.1 会话控制</h3>
+
+    <table>
+      <thead>
+        <tr>
+          <th>命令</th>
+          <th>说明</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><code>/new</code> 或 <code>/reset</code></td>
+          <td>开始新会话</td>
+        </tr>
+        <tr>
+          <td><code>/retry</code></td>
+          <td>重新发送上一条消息</td>
+        </tr>
+        <tr>
+          <td><code>/undo</code></td>
+          <td>撤销最后一轮对话</td>
+        </tr>
+        <tr>
+          <td><code>/title NAME</code></td>
+          <td>给会话命名</td>
+        </tr>
+        <tr>
+          <td><code>/compress</code></td>
+          <td>手动压缩上下文</td>
+        </tr>
+        <tr>
+          <td><code>/background PROMPT</code></td>
+          <td>后台执行任务</td>
+        </tr>
+        <tr>
+          <td><code>/resume NAME</code></td>
+          <td>恢复命名会话</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <h3>6.2 模型与配置</h3>
+
+    <table>
+      <thead>
+        <tr>
+          <th>命令</th>
+          <th>说明</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><code>/model [name]</code></td>
+          <td>查看或切换模型</td>
+        </tr>
+        <tr>
+          <td><code>/config</code></td>
+          <td>查看配置（CLI）</td>
+        </tr>
+        <tr>
+          <td><code>/tools</code></td>
+          <td>管理工具启停</td>
+        </tr>
+        <tr>
+          <td><code>/skills</code></td>
+          <td>搜索和安装技能</td>
+        </tr>
+        <tr>
+          <td><code>/yolo</code></td>
+          <td>跳过危险命令审批</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <h3>6.3 工具类</h3>
+
+    <table>
+      <thead>
+        <tr>
+          <th>命令</th>
+          <th>说明</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><code>/help</code></td>
+          <td>列出所有命令</td>
+        </tr>
+        <tr>
+          <td><code>/history</code></td>
+          <td>显示对话历史</td>
+        </tr>
+        <tr>
+          <td><code>/usage</code></td>
+          <td>查看 Token 用量</td>
+        </tr>
+        <tr>
+          <td><code>/save</code></td>
+          <td>保存对话到文件</td>
+        </tr>
+        <tr>
+          <td><code>/debug</code></td>
+          <td>上传调试报告</td>
+        </tr>
+        <tr>
+          <td><code>/quit</code> 或 <code>/exit</code></td>
+          <td>退出</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <h2>七、实战：本机部署架构</h2>
+
+    <p>以本机实际部署为例，看一下完整的架构：</p>
+
+    <pre class="mermaid">
+graph TD
+    A[用户终端 CLI] --> B[Hermes Agent<br/>v0.15.1]
+    C[飞书客户端] --> D[Gateway<br/>systemd 服务]
+    D --> B
+    B --> E[DeepSeek API<br/>deepseek-v4-pro]
+    B --> F[工具集]
+    F --> G[terminal]
+    F --> H[file]
+    F --> I[web]
+    F --> J[delegation]
+    B --> K[技能库<br/>~/.hermes/skills/]
+    B --> L[记忆<br/>state.db]
+    B --> M[定时任务<br/>Cron Scheduler]
+  </pre>
+
+    <ul>
+      <li><strong>模型层：</strong>DeepSeek V4 Pro，通过 <code>~/.hermes/.env</code> 中的 <code>DEEPSEEK_API_KEY</code> 认证</li>
+      <li><strong>网关层：</strong>Gateway 作为 systemd 服务运行，WebSocket 长连接飞书，接收消息后转发给 Agent 处理</li>
+      <li><strong>工具层：</strong>启用了 terminal、file、web、delegation、cronjob 等 15 个工具集</li>
+      <li><strong>记忆层：</strong>SQLite + FTS5 全文索引，跨会话持久化</li>
+      <li><strong>技能层：</strong>30+ 预装技能，覆盖编码、运维、数据科学、创意等场景</li>
+    </ul>
+
+    <script src="../assets/js/mermaid.min.js"></script>
+    <script>
+      mermaid.initialize({ startOnLoad: true, theme: 'dark' });
+    </script>
+
+    <h2>八、常见问题</h2>
+
+    <h3>Q: Gateway 启动后飞书没反应？</h3>
+    <p>检查三步：</p>
+    <ol>
+      <li><code>hermes gateway status</code> 确认服务正在运行</li>
+      <li><code>grep -i feishu ~/.hermes/logs/gateway.log | tail -20</code> 查看飞书连接日志</li>
+      <li>确认 <code>lark-oapi</code> 已安装：<code>python -c "import lark_oapi"</code></li>
+    </ol>
+
+    <h3>Q: DeepSeek API 返回 401？</h3>
+    <p>检查 <code>~/.hermes/.env</code> 中 <code>DEEPSEEK_API_KEY</code> 是否正确。注意不要有多余的引号或空格。可以用 <code>hermes doctor</code> 诊断。</p>
+
+    <h3>Q: 工具或技能修改不生效？</h3>
+    <p>工具和技能在会话启动时加载，修改后需要 <code>/reset</code> 开始新会话。Gateway 模式下用 <code>/restart</code> 重启。</p>
+
+    <h3>Q: SSH 断开后 Gateway 停止？</h3>
+    <p>需要 enable linger：<code>sudo loginctl enable-linger $USER</code>，然后用 <code>sudo hermes gateway install</code> 安装为系统服务。</p>
+
+    <h3>Q: 如何用本地模型替代 DeepSeek？</h3>
+    <p>Hermes 支持通过 llama.cpp、vLLM 等运行本地模型。配置 <code>model.provider: custom</code> 并设置 <code>model.base_url</code> 指向本地推理服务。</p>
+
+    <h2>九、总结</h2>
+
+    <p>Hermes Agent 的核心优势在于<strong>灵活性和可扩展性</strong>：不锁定任何模型供应商，支持 15+ 消息平台，自带技能系统和持久记忆。对于国内开发者，配合 DeepSeek API（国内直连、低延迟、高性价比）和飞书（日常协作工具），可以构建一个真正融入工作流的 AI 助手。</p>
+
+    <p>安装路径回顾：</p>
+
+    <ol>
+      <li><code>curl ... | bash</code> 一键安装 Hermes</li>
+      <li>配置 <code>DEEPSEEK_API_KEY</code> + <code>model.provider: deepseek</code></li>
+      <li>创建飞书应用 → 安装 <code>lark-oapi</code> → 配置 <code>FEISHU_*</code> 环境变量</li>
+      <li><code>sudo hermes gateway install</code> 让 Gateway 开机自启</li>
+    </ol>
+
+    <p>官方文档：<a href="https://hermes-agent.nousresearch.com/docs/" target="_blank" rel="noopener">hermes-agent.nousresearch.com/docs</a></p>
+    <p>GitHub 仓库：<a href="https://github.com/NousResearch/hermes-agent" target="_blank" rel="noopener">github.com/NousResearch/hermes-agent</a></p>
+
+  </article>
+
+  <script src="../assets/js/common.js"></script>
+
+</body>
+</html>

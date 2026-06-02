@@ -1,6 +1,19 @@
 var POSTS_DATA = 
 [
   {
+    "title": "Hermes Agent 安装配置指南：接入 DeepSeek API 和飞书",
+    "slug": "2026-06-02-hermes-agent-setup-guide",
+    "date": "2026-06-02",
+    "tags": [
+      "Hermes Agent",
+      "AI编程",
+      "DeepSeek",
+      "飞书",
+      "开发工具"
+    ],
+    "summary": "从零安装 Hermes Agent 开源 AI 代理框架，配置 DeepSeek API 作为模型后端，接入飞书实现多平台交互，以及日常开发最常用命令速查。"
+  },
+  {
     "title": "Claude Code 开发实战指南：Superpowers + GStack 插件安装与常用命令",
     "slug": "2026-06-01-claude-code-development-tutorial",
     "date": "2026-06-01",
