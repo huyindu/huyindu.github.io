@@ -1,6 +1,19 @@
 var POSTS_DATA = 
 [
   {
+    "title": "CC Switch 实战：把 DeepSeek 接入 Codex，在 Claude Code 中实现多视角代码审查",
+    "slug": "2026-06-04-cc-switch-codex-deepseek",
+    "date": "2026-06-04",
+    "tags": [
+      "cc-switch",
+      "Codex",
+      "DeepSeek",
+      "Claude Code",
+      "AI编程"
+    ],
+    "summary": "用 CC Switch 将 DeepSeek-V4 接入 Codex，配合 Claude Code 实现双模型交叉代码审查"
+  },
+  {
     "title": "Hermes Agent 安装配置指南：接入 DeepSeek API 和飞书",
     "slug": "2026-06-02-hermes-agent-setup-guide",
     "date": "2026-06-02",

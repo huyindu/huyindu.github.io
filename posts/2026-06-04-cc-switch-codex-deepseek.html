@@ -1,0 +1,157 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>CC Switch 实战：把 DeepSeek 接入 Codex，在 Claude Code 中实现多视角代码审查 - HoEndo的技术博客</title>
+  <meta name="article-date" content="2026-06-04">
+  <meta name="article-tags" content="cc-switch,Codex,DeepSeek,Claude Code,AI编程">
+  <meta name="description" content="用 CC Switch 将 DeepSeek-V4 接入 Codex，配合 Claude Code 实现双模型交叉代码审查">
+</head>
+<body>
+
+  <article class="post-content">
+    <h1>CC Switch 实战：把 DeepSeek 接入 Codex，在 Claude Code 中实现多视角代码审查</h1>
+
+    <p>我在实际项目里试了一套组合：Claude Code 写代码，Codex + DeepSeek-V4 审代码。效果比预期好——DeepSeek 指出了 3 个 Claude 完全忽略的空指针风险，和一个在中文文档注释里硬编码路径的坑。换单一模型审查自己的产出，盲区是真实存在的。</p>
+
+    <p>这套流程能跑通，靠的是 CC Switch v3.16.0 刚加的 Chat Completions → Responses 协议转换。Codex 只认 OpenAI Responses API，而 DeepSeek、Kimi、GLM 这些国产模型说的都是 Chat Completions，以前根本接不进去。现在 CC Switch 在本地做了一层代理，帮你把两边翻译通。</p>
+
+    <h2>核心链路：协议转换怎么做的</h2>
+
+    <p>Codex 和国产模型之间的协议差异不只是 URL 不同，整个请求体和响应格式都是两套东西：</p>
+
+    <table>
+      <thead><tr><th>差异点</th><th>Responses API</th><th>Chat Completions API</th></tr></thead>
+      <tbody>
+        <tr><td>请求路径</td><td><code>/v1/responses</code></td><td><code>/chat/completions</code></td></tr>
+        <tr><td>流式事件格式</td><td>Responses SSE 事件族</td><td>Chat SSE delta 事件</td></tr>
+        <tr><td>推理/思考</td><td>内联 <code>&lt;think&gt;</code> 块</td><td><code>reasoning_content</code> 字段</td></tr>
+        <tr><td>工具调用</td><td>Responses tool 结构</td><td>Chat tool_calls 结构</td></tr>
+        <tr><td>会话续接</td><td><code>previous_response_id</code></td><td>messages 数组全量携带</td></tr>
+      </tbody>
+    </table>
+
+    <p>把 Chat 格式的 API 直接塞进 Codex 配置，结果就是 404、400、流式解析崩溃。CC Switch 的方案是启动一个本地代理（默认 <code>127.0.0.1:15721</code>），Codex 始终以 Responses 格式跟代理对话，代理在中间做双向转换：</p>
+
+    <pre><code class="language-text">Codex 发送 Responses 请求
+        ↓
+CC Switch 本地路由（127.0.0.1:15721）
+        ↓ 请求转换：Responses → Chat Completions
+第三方 DeepSeek API
+        ↓ 响应转换：Chat Completions → Responses
+CC Switch 本地路由
+        ↓
+Codex 收到标准 Responses 响应</code></pre>
+
+    <p>转换过程保留了 reasoning_content、think 块、流式推理摘要、工具调用状态和 previous_response_id 续接链路。v3.16.0 还会根据上游供应商自动识别推理接口并注入正确的 thinking 参数——DeepSeek 走 <code>thinking:{type}</code>，Kimi 走 <code>enable_thinking</code>，OpenRouter 走原生 <code>reasoning:{effort}</code>。不需要手配，也不用担心把不支持的参数透传过去导致上游拒请求。</p>
+
+    <p>v3.16.0 一次性上了 22 个带 Chat 路由的 Codex 供应商预设，覆盖了几乎所有国内主流模型——智谱 GLM、Kimi、MiniMax、StepFun、百炼、SiliconFlow、火山、豆包 Seed 等。之前适配一个供应商要手写一整套协议转换代码，现在勾一下「需要本地路由映射」开关就完事。</p>
+
+    <h2>多视角审查：这条路实际怎么走</h2>
+
+    <p>CC Switch 同时管着 Claude Code 和 Codex 的供应商配置，切换模型不需要改配置文件——这是多视角审查能落地的前提。思路很简单：</p>
+
+    <ul>
+      <li><strong>Claude Code</strong>（配 Claude Opus 或 Sonnet）：主力编程，写代码、修 bug、重构</li>
+      <li><strong>Codex + DeepSeek-V4</strong>（通过 CC Switch 路由）：独立审查，从不同角度审视同一段代码</li>
+    </ul>
+
+    <p>操作上分三步。在 Claude Code 里完成一轮开发后，生成 diff：</p>
+
+    <pre><code class="language-bash">git diff HEAD -- '*.py' '*.ts' '*.go' &gt; /tmp/review-diff.patch</code></pre>
+
+    <p>打开另一个终端启动 Codex（它通过 CC Switch 已经指向 DeepSeek），把 diff 丢进去：</p>
+
+    <pre><code class="language-text">&gt; 审查 /tmp/review-diff.patch，从安全性、正确性、性能和可维护性四个维度给意见</code></pre>
+
+    <p>审查结果带回 Claude Code，让它逐条处理。如果问题多，可以让 Claude Code 先分类——哪些是必须修的、哪些是建议优化的、哪些可以忽略——然后按优先级修复。</p>
+
+    <p>我在一个 2000 行的 PR 上实际跑过这套流程。Claude Code 写完代码后自审了一遍，没发现问题。Codex + DeepSeek 额外挖出了：</p>
+
+    <ul>
+      <li>JWT payload 里直接存了用户手机号——应该只存 user_id 然后查库，手机号是敏感信息</li>
+      <li>两处数据库查询没有 N+1 保护，数据量上去之后性能会崩</li>
+      <li>一个测试用例的 mock 没有在 teardown 里清理，导致后续测试随机挂——这种问题 CI 上极难复现</li>
+    </ul>
+
+    <p>这三个问题 Claude 自审都没提。不是我黑 Claude——任何模型审查自己的产出都有盲区。代码是你写的，审查时大脑会自动跳过那些「我知道这里没问题」的地方，而另一个模型没有这个预设。</p>
+
+    <p>换不同模型做审查的价值还体现在它们的知识侧重点不同。Claude 对英文社区的常见模式和 bug 模式更敏感，DeepSeek 在中文注释相关逻辑、国内常见业务场景（手机号验证、身份证格式、微信支付回调等）上判断更准。同一个 PR，两边给的建议经常不重叠——加起来才是完整的审查意见。而且这个成本很低：按 DeepSeek 的 API 定价，审查一个 2000 行的 PR 大概消耗几毛钱，比找第二个同事 review 便宜得多。</p>
+
+    <h2>配通 DeepSeek：四步走</h2>
+
+    <h3>安装</h3>
+
+    <p>从 <a href="https://github.com/farion1231/cc-switch/releases" target="_blank" rel="noopener">GitHub Releases</a> 下载 CC Switch（要求 ≥ 3.16.1），macOS 可以 <code>brew install --cask cc-switch</code>。Windows 下 <code>.msi</code>，Linux 下 <code>.deb</code> / <code>.rpm</code> / <code>.AppImage</code>。安装后打开，确认版本号 ≥ 3.16.1。</p>
+
+    <h3>添加 DeepSeek 供应商</h3>
+
+    <p>CC Switch 顶部切到 Codex 标签 → 右上角加号 → 选择「DeepSeek」预设。填入 API Key（<code>sk-xxx</code>）。预设已经自动配好了：</p>
+
+    <ul>
+      <li>base URL：<code>https://api.deepseek.com</code></li>
+      <li>模型映射表：deepseek-v4-pro（128K）、v4-flash（128K）、v3-0324（128K）等</li>
+      <li>「需要本地路由映射」开关：已打开（DeepSeek 是 Chat Completions 接口，必须走协议转换）</li>
+    </ul>
+
+    <p>你可以把默认模型改为 <code>deepseek-v4-pro</code>，其他不用动，保存。预设里的模型映射表不是摆设——它决定了 Codex 的 <code>/model</code> 菜单里会列出哪些模型，以及每个模型的上下文窗口大小，UI 里可以直接编辑增删。修改映射表后必须重启 Codex 才能生效，因为模型目录是启动时一次性加载的。</p>
+
+    <h3>开启本地路由接管 Codex</h3>
+
+    <p>设置 → 路由 → 本地路由：</p>
+
+    <ol>
+      <li>打开「路由总开关」，启动本地代理（默认 <code>127.0.0.1:15721</code>）</li>
+      <li>在「路由启用」中打开「Codex」</li>
+    </ol>
+
+    <p>接管后，CC Switch 会把 Codex 的 live 配置指向 <code>http://127.0.0.1:15721/v1</code>，<code>wire_api</code> 强制保持 <code>responses</code>。真实的 API Key 留在 CC Switch 的供应商配置里，不会暴露到 Codex 文件。这套机制的好处是切换供应商完全在 CC Switch 层面完成——Codex 自己只知道「我在跟一个 Responses API 对话」，至于这个 API 背后是 DeepSeek 还是 Kimi，Codex 完全不关心，也不应该关心。</p>
+
+    <p>验证接管是否生效：</p>
+
+    <pre><code class="language-bash">grep -A5 '\[api\]' ~/.codex/config.toml
+# 应该看到 base_url = "http://127.0.0.1:15721/v1"</code></pre>
+
+    <h3>切换并重启</h3>
+
+    <p>Codex 面板里启用 DeepSeek 供应商，然后重启 Codex。<code>config.toml</code> 和 <code>model_catalog_json</code> 都是启动时加载的，运行中不会热更——这是 Codex 的设计，不是 CC Switch 的问题。重启后用 <code>/model</code> 确认当前模型是 DeepSeek 预设里的模型，发一个 prompt 测试：</p>
+
+    <pre><code class="language-text">&gt; 用 Python 写一个快速排序</code></pre>
+
+    <p>在 CC Switch 用量面板里能看到请求的 token 消耗和成本，确认流量走了 DeepSeek。还可以顺手看一眼路由面板的请求数——如果数字在涨，说明链路没断。</p>
+
+    <h2>保留官方登录态（可选）</h2>
+
+    <p>Codex App 的手机远程操作和官方插件依赖 <code>~/.codex/auth.json</code> 里的 OpenAI 登录缓存。如果直接把第三方 API Key 写进 <code>auth.json</code>，这些功能就没了。v3.16.1 的解决方案是：</p>
+
+    <ol>
+      <li>先在 CC Switch 里切到 OpenAI Official 供应商，启动 Codex 用 OpenAI 账号登录一次（Free 订阅就行）</li>
+      <li>设置 → 通用 → Codex 应用增强 → 打开「切换第三方时保留官方登录」</li>
+      <li>切回 DeepSeek，重启 Codex</li>
+    </ol>
+
+    <p>开启后，CC Switch 的切换逻辑只写 <code>config.toml</code>（管模型供应商和 API Key），不动 <code>auth.json</code>（管官方登录态）。Codex App 仍然认为你是官方账号，但实际模型请求走的是 DeepSeek。这个方案的代价是 Codex 界面里的账号显示始终是官方账号，你没法从 UI 上直接看出当前用的是哪个供应商的模型——需要到 CC Switch 的用量面板或请求日志里确认。</p>
+
+    <p>如果你不需要手机远程操作和官方插件，这一节可以跳过。直接把「保留官方登录」关掉，CC Switch 会走兼容旧版本的写入路径，第三方 API Key 直接写进 <code>auth.json</code>。两种方式在模型流量上没区别，区别只在于 Codex App 侧的功能可用性。</p>
+
+    <blockquote>
+      <p><strong>注意：</strong>Codex App 里显示的账号始终是官方账号，不代表流量还在走 OpenAI。实际供应商以 CC Switch 当前选中为准，可以在用量面板或请求日志里确认。</p>
+    </blockquote>
+
+    <h2>踩过的坑</h2>
+
+    <p>三个最容易卡住的地方：</p>
+
+    <p><strong>Codex 报 404。</strong> 几乎都是没开 Codex 接管。检查 <code>~/.codex/config.toml</code> 的 base_url 是不是指向 <code>127.0.0.1:15721/v1</code>，同时确认本地路由的 Codex 开关已打开。另外如果你用的是自定义供应商而非预设，注意 base URL 是服务根地址（如 <code>https://api.deepseek.com</code>），不要带 <code>/v1</code> 后缀或 <code>/chat/completions</code> 路径——路由层会自动补。</p>
+
+    <p><strong>/model 菜单看不到 DeepSeek 模型。</strong> 必须重启 Codex。模型目录是启动时加载的，这跟 CC Switch 的接管状态无关。</p>
+
+    <p><strong>流式响应异常或 token 统计为 0。</strong> 确认供应商表单里「需要本地路由映射」已打开。这个开关控制的是是否做 Chat → Responses 转换——关了就等于把 Chat 接口直接暴露给只认 Responses 的 Codex，流式事件当然对不上。如果你用的是中转站或者聚合平台（OpenRouter、SiliconFlow 等），同样要确认 API 格式选的是 Chat Completions 并开了路由映射。</p>
+
+  </article>
+
+  <script src="../assets/js/common.js"></script>
+
+</body>
+</html>
