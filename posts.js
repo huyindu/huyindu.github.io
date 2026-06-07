@@ -1,6 +1,19 @@
 var POSTS_DATA = 
 [
   {
+    "title": "Gemma 4 QAT 本地部署：6 GB 显存跑 12B 多模态模型",
+    "slug": "2026-06-07-gemma-4-qat-llamacpp-local",
+    "date": "2026-06-07",
+    "tags": [
+      "Gemma 4",
+      "QAT",
+      "llama.cpp",
+      "GGUF",
+      "本地部署"
+    ],
+    "summary": "Google DeepMind 发布 Gemma 4 12B 的 QAT 量化版本，GGUF 仅 6.26 GB，RTX 4060 8GB 可流畅运行。"
+  },
+  {
     "title": "CC Switch 实战：把 DeepSeek 接入 Codex，在 Claude Code 中实现多视角代码审查",
     "slug": "2026-06-04-cc-switch-codex-deepseek",
     "date": "2026-06-04",
