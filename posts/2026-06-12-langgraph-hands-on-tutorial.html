@@ -1,0 +1,800 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>LangGraph 实战教程：从零构建一个有记忆、会搜索、能审批的 AI Agent - HoEndo的技术博客</title>
+  <meta name="article-date" content="2026-06-12">
+  <meta name="article-tags" content="LangGraph,AI Agent,LLM,工具调用,Python">
+  <meta name="description" content="用 LangGraph 1.2 从零构建支持搜索、记忆、人工审批和自定义状态的 AI Agent，每步都有可运行代码。">
+</head>
+<body>
+
+  <article class="post-content">
+    <h1>LangGraph 实战教程：从零构建一个有记忆、会搜索、能审批的 AI Agent</h1>
+
+    <p>上个月 LangGraph 发布了 1.2 版本，带来了节点级超时、错误处理器和 DeltaChannel 等硬核特性。我花了一周时间系统学习了它的核心概念，从最基础的聊天机器人一路做到带记忆、会调用工具、能让人工审批的 Agent。</p>
+
+    <p>这篇文章就是我的学习记录——每走一步都带有<strong>完整可运行的代码</strong>，关键行有中文注释。即使你之前没接触过 LangGraph，跟着走一遍也能把核心机制搞明白。</p>
+
+    <h2>先搞清楚：LangGraph 解决什么问题</h2>
+
+    <p>直接用 LLM 的 API 构建应用，遇到的问题通常是这样的：</p>
+
+    <ul>
+      <li>对话越来越长，怎么管理上下文？</li>
+      <li>想让 LLM 调搜索引擎，但 LLM 本身不会真去搜——谁来执行实际的搜索？</li>
+      <li>多轮对话中，用户上一轮说了名字，下一轮机器人就忘了——怎么持久化？</li>
+      <li>LLM 决定调某个工具之前，能不能让人看一眼？</li>
+      <li>出错了想回到之前的某个状态重来，能做到吗？</li>
+    </ul>
+
+    <p>LangGraph 的答案是：<strong>把 LLM 应用建模成一个有状态的图（Graph）</strong>。节点做具体工作（调 LLM、执行工具、等待人工），边控制流转方向，状态在节点之间传递并被持久化。这个模型足够通用，能覆盖从简单聊天到复杂多 Agent 协作的各种场景。</p>
+
+    <div style="background:#1e2a3a;border-left:4px solid #4fc3f7;padding:12px 16px;margin:16px 0;border-radius:4px;">
+      <strong>📦 环境准备</strong><br>
+      以下代码基于 LangGraph 1.2.4（2026年6月发布的最新稳定版）和 langchain-anthropic 1.4.5。安装命令：
+      <pre><code class="language-bash">pip install "langgraph>=1.2" "langchain-anthropic>=1.4" "langgraph-checkpoint>=4.1"</code></pre>
+    </div>
+
+    <h2>一、StateGraph 三要素：节点、边、状态</h2>
+
+    <p>如果把 LangGraph 比作一条工厂流水线：</p>
+
+    <ul>
+      <li><strong>节点（Node）</strong>——流水线上的工位，每个工位做一件具体的事（调 LLM、执行搜索、等待人工输入）</li>
+      <li><strong>边（Edge）</strong>——连接工位的传送带，决定数据往哪流</li>
+      <li><strong>状态（State）</strong>——在传送带上传递的"产品"，被每个工位读取和修改</li>
+    </ul>
+
+    <p>这三个概念贯穿 LangGraph 的全部用法，后面的所有功能——工具调用、记忆、人工审批、时间旅行——都是在这三个基础上叠加的。</p>
+
+    <p>先看一个最简例子：用户发消息 → LLM 回复 → 结束。只有 9 步代码：</p>
+
+    <pre><code class="language-python"># 第1步：导入
+from typing import Annotated
+from typing_extensions import TypedDict
+from langgraph.graph import StateGraph, START, END
+from langgraph.graph.message import add_messages
+
+# 第2步：定义 State —— 流水线上传递的数据结构
+class State(TypedDict):
+    # Annotated[list, add_messages] 含义：
+    # 类型是 list，更新时用 add_messages 函数处理
+    # 有了它，新消息会追加到列表末尾，而不是覆盖旧消息
+    messages: Annotated[list, add_messages]
+
+# 第3步：初始化 LLM
+from langchain_anthropic import ChatAnthropic
+llm = ChatAnthropic(model="claude-sonnet-4-6")
+
+# 第4步：创建图纸
+graph_builder = StateGraph(State)
+
+# 第5步：定义节点函数 —— 流水线上的工位
+def chatbot(state: State):
+    """从 state 中取消息 → 发给 LLM → 返回新消息"""
+    return {"messages": [llm.invoke(state["messages"])]}
+
+# 第6步：把节点加到图上
+graph_builder.add_node("chatbot", chatbot)
+
+# 第7步：画边 —— 决定数据流向
+graph_builder.add_edge(START, "chatbot")   # 从 START 开始，先进 chatbot
+graph_builder.add_edge("chatbot", END)     # chatbot 执行完就结束
+
+# 第8步：编译 —— 图纸变成可运行的机器
+graph = graph_builder.compile()
+
+# 第9步：运行
+def stream_graph_updates(user_input: str):
+    for event in graph.stream({"messages": [("user", user_input)]}):
+        for value in event.values():
+            print("Assistant:", value["messages"][-1].content)
+
+while True:
+    user_input = input("User: ")
+    if user_input.lower() in ["quit", "exit", "q"]:
+        print("Goodbye!")
+        break
+    stream_graph_updates(user_input)</code></pre>
+
+    <p>这段代码跑起来就是一个命令行聊天机器人。核心骨架已经搭好了：State 定义数据结构 → StateGraph 画图纸 → add_node 放工位 → add_edge 画传送带 → compile 出机器 → stream 跑起来。后面所有高级功能都是在这个骨架上加东西。</p>
+
+    <h3>TypedDict、Annotated、add_messages 到底在干什么</h3>
+
+    <p>初学者最困惑的三个东西：<code>TypedDict</code>、<code>Annotated</code>、<code>add_messages</code>。分开来看：</p>
+
+    <p><strong>TypedDict</strong> 是 Python 的一个类型提示工具。普通的 <code>dict</code> 可以随便放任何键值对：<code>{"name": "张三", "age": 25, "任意键": "任意值"}</code>。而 <code>TypedDict</code> 事先声明了"这个字典允许哪些键，每个键是什么类型"——本质上是一个"有规矩的字典"。在 LangGraph 里，State 用 TypedDict 定义，框架就能在编译期检查每个节点读写 State 的合法性。</p>
+
+    <p><strong>Annotated</strong> 是 Python 的类型"贴标签"机制。<code>Annotated[list, add_messages]</code> 的含义是："这个字段的类型是 <code>list</code>，但在更新时别用默认的覆盖逻辑，用 <code>add_messages</code> 函数来处理。"LangGraph 在内部读取 Annotated 的第二个参数，找到对应的更新函数，用它来合并新旧值。</p>
+
+    <p><strong>add_messages</strong> 就是这个更新函数。它做两件事：比较新旧消息的 ID，ID 不存在的追加到末尾，ID 重复的原地替换。这个设计解决了多节点并发写 State 的冲突问题——每个节点追加自己的输出，谁也不会把谁的抹掉。</p>
+
+    <p>一个常见的疑问：为什么不直接在节点函数里手动 <code>.append()</code>？因为 LangGraph 的节点函数返回值是一个字典，框架拿到这个字典后自动合并到 State 里。如果不指定 Annotated，合并时就用 Python 默认的赋值语义——后者覆盖前者。有了 add_messages，合并就变成了追加。</p>
+
+    <h3>add_messages 的追加逻辑</h3>
+
+    <p>你可能注意到 <code>messages: Annotated[list, add_messages]</code> 这个写法有点特别。它的作用是告诉 LangGraph：更新 messages 时不要覆盖，要追加。</p>
+
+    <p>设想一下：如果多个节点都往 messages 里写东西，默认的覆盖模式会让后一个节点把前一个节点的输出抹掉。<code>add_messages</code> 确保大家都追加，不会互相踩。具体规则有两条：</p>
+
+    <ol>
+      <li>新消息的 ID 在旧列表中不存在 → <strong>追加</strong>到末尾</li>
+      <li>新消息的 ID 和某条旧消息相同 → <strong>替换</strong>那条旧的</li>
+    </ol>
+
+    <p>规则 2 的妙用要在第五部分手动更新状态时才能体现——利用相同 ID 做覆盖，可以"时光倒流"修改 LLM 的历史决策。</p>
+
+    <h2>二、给机器人装上"手"：工具调用</h2>
+
+    <p>纯 LLM 聊天机器人有个根本限制：<strong>它只能基于训练数据回答，不知道训练截止日期之后的事。</strong>想让机器人能搜索互联网、查数据库、调 API，就得给它绑定工具。</p>
+
+    <p>工具调用的本质是：<strong>LLM 自己不动手，它只"表达意愿"——我想搜什么，参数是什么——然后由专门的节点来实际执行。</strong></p>
+
+    <h3>Agent 循环：思考 → 行动 → 观察</h3>
+
+    <p>工具调用的流程不是一条直线，而是一个循环。这是 Agent 最核心的工作模式：</p>
+
+    <div style="background:#1e2a3a;border-left:4px solid #4fc3f7;padding:12px 16px;margin:16px 0;border-radius:4px;">
+      <strong>🔁 Agent 循环</strong><br><br>
+      用户："LangGraph 是什么？"<br>
+      ↓ <strong>chatbot 节点</strong>：LLM 判断"我不知道，需要搜一下"→ 返回 tool_call 而不是文本<br>
+      ↓ <strong>路由函数</strong>：检测到 tool_call → 转发到 tools 节点<br>
+      ↓ <strong>tools 节点</strong>：调用搜索 API，拿到结果 → 包装成 ToolMessage 写回 State<br>
+      ↓ <strong>chatbot 节点</strong>：LLM 读到搜索结果 → 整理成自然语言回答 → 不再发 tool_call<br>
+      ↓ <strong>路由函数</strong>：没有 tool_call → 发送到 END<br>
+      用户得到最终答案
+    </div>
+
+    <h3>完整代码</h3>
+
+    <pre><code class="language-python">from typing import Annotated
+from typing_extensions import TypedDict
+from langgraph.graph import StateGraph, START, END
+from langgraph.graph.message import add_messages
+from langgraph.prebuilt import ToolNode, tools_condition
+from langchain_anthropic import ChatAnthropic
+from langchain_community.tools.tavily_search import TavilySearchResults
+
+# 1. 创建搜索工具
+tool = TavilySearchResults(max_results=2)
+tools = [tool]
+
+# 2. 初始化 LLM 并绑定工具
+llm = ChatAnthropic(model="claude-sonnet-4-6")
+# ⭐ bind_tools 是关键：把工具定义（JSON Schema）注入 LLM 的 system prompt
+# LLM 看到工具后，如果判断"需要搜索"，就返回 tool_call 而不是普通文本
+llm_with_tools = llm.bind_tools(tools)
+
+# 3. State 和 Graph
+class State(TypedDict):
+    messages: Annotated[list, add_messages]
+
+graph_builder = StateGraph(State)
+
+# 4. chatbot 节点
+def chatbot(state: State):
+    # 用 llm_with_tools 而不是 llm，LLM 就能决定是否调用工具
+    return {"messages": [llm_with_tools.invoke(state["messages"])]}
+
+# 5. 用 LangGraph 预构建的 ToolNode（比自己实现更高效，支持并行工具调用）
+graph_builder.add_node("chatbot", chatbot)
+graph_builder.add_node("tools", ToolNode(tools=[tool]))
+
+# 6. ⭐ 条件边：chatbot 执行后，根据是否有 tool_call 决定下一步
+# tools_condition 是 LangGraph 内置的路由函数，逻辑等价于：
+#   if last_message.tool_calls: return "tools"
+#   else: return END
+graph_builder.add_conditional_edges("chatbot", tools_condition)
+graph_builder.add_edge("tools", "chatbot")  # 工具执行完回到 chatbot
+graph_builder.add_edge(START, "chatbot")
+
+graph = graph_builder.compile()</code></pre>
+
+    <p>这个 30 行不到的代码已经是一个能自主决定"要不要搜索、搜什么"的 Agent 了。核心在于 <code>bind_tools</code> 和 <code>tools_condition</code> 这两个环节，它们把工具的定义和路由逻辑标准化了。</p>
+
+    <h3>bind_tools 底层做了什么</h3>
+
+    <p>理解 <code>bind_tools</code> 的底层行为对排查问题很有帮助。调用 <code>llm.bind_tools(tools)</code> 时，LangChain 做了两件事：</p>
+
+    <ol>
+      <li>把每个工具的函数签名和 docstring 转换成 <strong>JSON Schema 格式的 Function Definition</strong>，包含 name、description、parameters 三个字段</li>
+      <li>将这些定义注入到发给 LLM 的 API 请求中（Anthropic API 对应 <code>tools</code> 参数，OpenAI API 对应 <code>tools</code> 参数）</li>
+    </ol>
+
+    <p>LLM 收到工具定义后，在生成回复时有两种选择：正常输出文本（<code>content</code> 字段），或者输出一个 <code>tool_calls</code> 数组，每个元素包含工具名和参数。LLM 不会真的去执行任何东西——它只是在说"我想调用这个工具，参数是这些"。</p>
+
+    <p><strong>ToolNode 才是真正干活的。</strong>它遍历上一条消息的 <code>tool_calls</code> 数组，按名称找到对应的工具实例，调用其 <code>invoke()</code> 方法，然后把结果包装成 <code>ToolMessage</code> 写回 State。ToolMessage 里有一个 <code>tool_call_id</code> 字段，用来和原始请求配对——LLM 依赖这个 ID 知道"这个结果是对应我之前哪个调用的"。</p>
+
+    <h3>为什么需要循环：不只是调用一次工具</h3>
+
+    <p>你可能会问：工具执行完直接返回不就行了，为什么还要回到 chatbot 节点？因为 LLM 可能需要<strong>多轮工具调用</strong>。比如：</p>
+
+    <ol>
+      <li>用户："帮我比较一下 LangGraph 和 CrewAI 的优劣"</li>
+      <li>LLM：先搜 LangGraph（第 1 次 tool_call）→ 拿到结果</li>
+      <li>LLM：再搜 CrewAI（第 2 次 tool_call）→ 拿到结果</li>
+      <li>LLM：综合两边的信息，给出对比分析（最终回答）</li>
+    </ol>
+
+    <p>每次工具调用后回到 chatbot，LLM 根据新的信息重新判断"还需要搜吗？还是现在就能回答了？"这个过程就是 Agent 的本质——不是一次性决策，而是持续的信息收集和判断。</p>
+
+    <p>我一开始自己写 BasicToolNode 和 route_tools 函数来理解底层逻辑，但实际项目里直接用 LangGraph 预构建的 <code>ToolNode</code> 和 <code>tools_condition</code> 就行——预构建版支持并行工具调用（一条消息里同时调多个工具），性能更好。</p>
+
+    <h2>三、记忆：让机器人记住上一轮说了什么</h2>
+
+    <p>上面的 Agent 有个问题：每次 <code>graph.stream()</code> 都是全新对话。你第一轮说"我叫张三"，第二轮问"我叫什么？"，它完全不知道。</p>
+
+    <p>因为每次调用都是独立的 State，没有地方存历史。LangGraph 的解决方案是 <strong>Checkpointer（检查点持久化）</strong>——每个节点执行完后自动保存 State，下次用同一个 <code>thread_id</code> 就能恢复。</p>
+
+    <h3>Checkpointer 的原理</h3>
+
+    <table>
+      <thead>
+        <tr>
+          <th>没有 Checkpointer</th>
+          <th>有 Checkpointer</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>每次 graph.stream() 都是全新 State</td>
+          <td>根据 thread_id 自动恢复上一次的 State</td>
+        </tr>
+        <tr>
+          <td>对话之间完全失忆</td>
+          <td>同一 thread_id 下的所有对话都记得</td>
+        </tr>
+        <tr>
+          <td>无额外依赖</td>
+          <td>需要存储后端（内存/SQLite/Postgres）</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <h3>添加记忆只需要改一行</h3>
+
+    <p>和上面的代码比，唯一的变化是在 <code>compile()</code> 时传一个 <code>checkpointer</code>：</p>
+
+    <pre><code class="language-python">from langgraph.checkpoint.memory import MemorySaver
+
+memory = MemorySaver()  # 存在内存里，程序关了记忆就没了
+# 生产环境换成 SqliteSaver 或 PostgresSaver
+
+# ⭐ 唯一的区别：compile 时传入 checkpointer
+graph = graph_builder.compile(checkpointer=memory)
+
+# 为每个对话分配 thread_id
+config = {"configurable": {"thread_id": "1"}}
+
+# 第一轮
+events = graph.stream(
+    {"messages": [("user", "Hi there! My name is Will.")]},
+    config,  # ⭐ 传入 config，LangGraph 据此找到对应的历史 State
+    stream_mode="values"
+)
+
+# 第二轮（同一个 thread_id）—— 机器人记得上一轮！
+events = graph.stream(
+    {"messages": [("user", "Remember my name?")]},
+    config,  # ⭐ 同一个 config → 从检查点恢复对话历史
+    stream_mode="values"
+)
+# 输出: Of course, I remember your name, Will. ✅
+
+# 新 thread_id = 全新对话
+events = graph.stream(
+    {"messages": [("user", "Remember my name?")]},
+    {"configurable": {"thread_id": "2"}},  # 不同 thread_id → 白纸一张
+    stream_mode="values"
+)
+# 输出: I don't have any previous context... ✅</code></pre>
+
+    <p>三个实用的 Checkpointer 实现：</p>
+
+    <table>
+      <thead>
+        <tr>
+          <th>实现</th>
+          <th>存储位置</th>
+          <th>适用场景</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><code>MemorySaver</code></td>
+          <td>内存</td>
+          <td>开发调试、单次会话</td>
+        </tr>
+        <tr>
+          <td><code>SqliteSaver</code></td>
+          <td>SQLite 文件</td>
+          <td>轻量生产、单机部署</td>
+        </tr>
+        <tr>
+          <td><code>PostgresSaver</code></td>
+          <td>PostgreSQL</td>
+          <td>企业级、多实例共享</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <p>thread_id 的设计很巧妙——同一个 Graph 实例可以同时服务多个对话，每个对话有自己的 thread_id，互不干扰。就像银行不同账户各有各的流水记录。</p>
+
+    <h3>Checkpointer 的工作时机</h3>
+
+    <p>一个容易忽略的细节：Checkpointer 不是在 graph.stream() 结束时才保存，而是在<strong>每个 superstep 之后</strong>都保存。superstep 是 LangGraph 的执行单位——一个节点执行一次就是一个 superstep。这意味着哪怕 Graph 中途崩溃，最后成功的那个节点之后的状态已经被持久化了。</p>
+
+    <p>这种设计对生产环境至关重要。比如你的 Agent 调了一个耗时的外部 API（比如生成了一个 10 分钟的视频），生成完成后节点返回，Checkpointer 保存 State。如果下一步 LLM 调用网络超时了，重试时直接从视频生成节点之后恢复，不用再等 10 分钟。</p>
+
+    <p>检查点存储的内容可以通过 <code>graph.get_state(config)</code> 随时查看：</p>
+
+    <pre><code class="language-python">snapshot = graph.get_state(config)
+print(snapshot.values["messages"])  # 所有历史消息
+print(snapshot.next)                # 下一步要执行的节点（空元组 = 已执行完毕）
+print(snapshot.config)              # 包含 checkpoint_id 的完整配置</code></pre>
+
+    <h2>四、人工参与：在工具执行前踩一脚刹车</h2>
+
+    <p>Agent 自动执行工具有风险。比如它决定调用一个写数据库的工具，你希望在真正执行之前看一眼参数对不对。LangGraph 用 <code>interrupt_before</code> 实现这个"刹车"机制。</p>
+
+    <p>加中断也只需要改一行 <code>compile()</code>：</p>
+
+    <pre><code class="language-python"># ⭐ 中断必须和 Checkpointer 一起使用（中断后要靠 Checkpointer 恢复）
+graph = graph_builder.compile(
+    checkpointer=memory,
+    interrupt_before=["tools"],  # ⭐ 在进入 tools 节点之前暂停
+)
+
+# 发一条需要搜索的消息
+user_input = "I'm learning LangGraph. Could you do some research on it for me?"
+config = {"configurable": {"thread_id": "1"}}
+
+# Graph 执行到 tools 节点前自动暂停
+events = graph.stream(
+    {"messages": [("user", user_input)]}, config, stream_mode="values"
+)
+# LLM 已经返回了 tool_call，但还没有真正执行搜索！
+
+# 查看当前状态
+snapshot = graph.get_state(config)
+print(snapshot.next)  # ('tools',) → 下一步本该去 tools，但被拦住了
+
+# 人可以审查 LLM 想搜什么
+ai_message = snapshot.values["messages"][-1]
+print(ai_message.tool_calls)
+# → [{'name': 'tavily_search...', 'args': {'query': 'LangGraph'}}]
+# 你可以在这里判断：这个搜索词合理吗？要不要改？
+
+# 审批通过后，传 None 从断点继续
+events = graph.stream(None, config, stream_mode="values")
+# → tools 节点执行 → chatbot 生成回答 → END</code></pre>
+
+    <h3>中断的底层流程</h3>
+
+    <div style="background:#1e2a3a;border-left:4px solid #4fc3f7;padding:12px 16px;margin:16px 0;border-radius:4px;">
+      <strong>中断 → 恢复的完整链路：</strong><br>
+      1. Graph 执行到 interrupt_before 指定的节点前 → 保存当前 State 到 Checkpointer<br>
+      2. graph.stream() 返回，控制权交还给调用方<br>
+      3. 调用方通过 graph.get_state(config) 检查状态，决定下一步<br>
+      4. 再次调用 graph.stream(None, config) → 从 Checkpointer 恢复 State → 继续执行
+    </div>
+
+    <p>这里有个关键约束：<strong>中断必须和 Checkpointer 一起使用。</strong>没有 Checkpointer，中断后就无法恢复了——状态没地方存。</p>
+
+    <p>除了 <code>interrupt_before</code>，还有 <code>interrupt_after</code> 可以选——在节点执行<strong>之后</strong>暂停。比如你希望工具执行完了先看看结果再决定要不要继续。</p>
+
+    <h3>实际应用：做个审批流程</h3>
+
+    <p>结合中断和人工检查，可以搭出简单的审批流程。比如敏感操作（发送邮件、修改数据库）之前暂停，让人确认参数后再继续：</p>
+
+    <pre><code class="language-python"># 编译时在敏感操作节点前中断
+graph = graph_builder.compile(
+    checkpointer=memory,
+    interrupt_before=["send_email", "update_database"],
+)
+
+# 中断后，人审查参数
+snapshot = graph.get_state(config)
+pending_action = snapshot.next  # e.g., ('send_email',)
+last_msg = snapshot.values["messages"][-1]
+
+# 批准或拒绝
+if user_approves(last_msg):
+    graph.stream(None, config)  # 继续
+else:
+    graph.update_state(config, {
+        "messages": [AIMessage(content="操作被拒绝，请重新考虑。")]
+    })</code></pre>
+
+    <h2>五、手动修改状态：覆盖 LLM 的决策</h2>
+
+    <p>中断之后，不只是看一眼——你还可以直接<strong>修改 State 来改变 Agent 的行为</strong>。这在实际场景里非常有用：</p>
+
+    <ul>
+      <li>LLM 的搜索词偏了，你想纠正</li>
+      <li>你其实知道答案，不想让 Agent 真的去调 API</li>
+      <li>你想让 Agent 假装已经完成了某个步骤，跳到下一个环节</li>
+    </ul>
+
+    <h3>场景一：直接给答案，跳过搜索</h3>
+
+    <pre><code class="language-python">from langchain_core.messages import AIMessage, ToolMessage
+
+# 拿到 LLM 发出的 tool_call
+snapshot = graph.get_state(config)
+ai_message = snapshot.values["messages"][-1]
+tool_call_id = ai_message.tool_calls[0]["id"]
+
+# 构造两条消息：ToolMessage（假装工具已返回）+ AIMessage（最终答案）
+answer = "LangGraph is a library for building stateful, multi-actor applications with LLMs."
+graph.update_state(config, {
+    "messages": [
+        ToolMessage(content=answer, tool_call_id=tool_call_id),
+        AIMessage(content=answer),
+    ]
+})
+# AIMessage 没有 tool_calls → Graph 认为对话已完成
+# 再次 stream 时直接从 END 退出</code></pre>
+
+    <h3>场景二：修改 LLM 的搜索词</h3>
+
+    <pre><code class="language-python">snapshot = graph.get_state(config)
+ai_message = snapshot.values["messages"][-1]
+
+# 复制原来的 tool_call，但修改搜索词
+new_tool_call = ai_message.tool_calls[0].copy()
+new_tool_call["args"]["query"] = "LangGraph human-in-the-loop workflow"
+
+# ⭐ 关键：用相同的 ID 创建新消息 → add_messages 会覆盖而不是追加
+new_message = AIMessage(
+    content=ai_message.content,
+    tool_calls=[new_tool_call],
+    id=ai_message.id,  # ⭐⭐⭐ 相同 ID = 覆盖！
+)
+
+graph.update_state(config, {"messages": [new_message]})
+
+# 恢复执行 → Agent 现在搜索的是我们修改过的关键词
+events = graph.stream(None, config, stream_mode="values")</code></pre>
+
+    <h3>相同 ID = 覆盖，不同 ID = 追加</h3>
+
+    <p>这两个场景演示了 <code>add_messages</code> 的两个规则在实际中的运用：</p>
+
+    <table>
+      <thead>
+        <tr>
+          <th>消息 ID</th>
+          <th>行为</th>
+          <th>类比</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>新 ID（旧列表中没有）</td>
+          <td>追加到末尾</td>
+          <td>在文档末尾加一段新文字</td>
+        </tr>
+        <tr>
+          <td>旧 ID（和列表中某条相同）</td>
+          <td>替换那条消息</td>
+          <td>修改文档的第 3 段，原地替换</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <p>场景二就是利用了规则 2——用相同 ID 创建新消息，实现"时光倒流"修改 LLM 之前的决定。</p>
+
+    <h3>什么时候用 update_state vs interrupt</h3>
+
+    <p>这两个机制都允许人在 Agent 执行中介入，但定位不同：</p>
+
+    <table>
+      <thead>
+        <tr>
+          <th></th>
+          <th>interrupt_before / interrupt_after</th>
+          <th>update_state</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>时机</td>
+          <td>Agent 执行过程中自动暂停</td>
+          <td>任何时间，包括 Agent 空闲时</td>
+        </tr>
+        <tr>
+          <td>用途</td>
+          <td>审批工具调用、检查中间结果</td>
+          <td>纠正 AI 决策、注入外部信息、修改对话方向</td>
+        </tr>
+        <tr>
+          <td>触发</td>
+          <td>框架自动（到达指定节点时）</td>
+          <td>手动调用（需要你知道 thread_id）</td>
+        </tr>
+        <tr>
+          <td>典型场景</td>
+          <td>发送邮件前审批</td>
+          <td>AI 搜索了错误的关键词，纠正后重来</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <p>实际使用中经常是两个配合：用 interrupt 暂停，暂停期间用 update_state 修改参数，然后恢复执行。update_state 不只修改当前 State——它也会创建一个新 checkpoint，所以修改历史是可追溯的。</p>
+
+    <h2>六、自定义状态：让 LLM 自己决定要不要找人帮忙</h2>
+
+    <p>第四部分的 <code>interrupt_before=["tools"]</code> 是<strong>强制中断</strong>——每次到 tools 就停，不管 LLM 有没有这个需要。但在实际场景里，你可能希望：<strong>只有 LLM 自己觉得不确定的时候，才去找人确认。</strong></p>
+
+    <p>实现这个需求需要三个步骤：</p>
+
+    <ol>
+      <li>扩展 State，添加一个 <code>ask_human</code> 开关字段</li>
+      <li>给 LLM 绑定一个"请求人工协助"工具——LLM 不确定时就调用它</li>
+      <li>写一个自定义路由函数，根据 <code>ask_human</code> 决定下一站</li>
+    </ol>
+
+    <h3>完整代码</h3>
+
+    <pre><code class="language-python">from typing import Annotated
+from typing_extensions import TypedDict
+from pydantic import BaseModel
+from langgraph.graph import StateGraph, START, END
+from langgraph.graph.message import add_messages
+from langgraph.prebuilt import ToolNode, tools_condition
+from langgraph.checkpoint.memory import MemorySaver
+from langchain_anthropic import ChatAnthropic
+from langchain_community.tools.tavily_search import TavilySearchResults
+from langchain_core.messages import AIMessage, ToolMessage
+
+# 1. 扩展 State：添加 ask_human 开关
+class State(TypedDict):
+    messages: Annotated[list, add_messages]
+    ask_human: bool  # ⭐ 新字段：True = 需要人工，False = 不需要
+    # 注意：不用 Annotated → 使用覆盖模式（开关只有开/关，不需要累加）
+
+# 2. 用 Pydantic 定义"请求人工协助"工具
+class RequestAssistance(BaseModel):
+    """当你不确定如何回答，或者用户的问题需要人工介入时，调用此工具。
+    参数 request 填写你需要人工帮助的具体内容。"""
+    request: str
+
+# 3. LLM 绑定两个工具：搜索 + 请求人工
+tool = TavilySearchResults(max_results=2)
+llm = ChatAnthropic(model="claude-sonnet-4-6")
+llm_with_tools = llm.bind_tools([tool, RequestAssistance])
+
+# 4. chatbot 节点：检测 LLM 是否调用了 RequestAssistance
+def chatbot(state: State):
+    response = llm_with_tools.invoke(state["messages"])
+    ask_human = False
+
+    if (
+        response.tool_calls
+        and response.tool_calls[0]["name"] == "RequestAssistance"
+    ):
+        ask_human = True  # ⭐ LLM 主动请求人工
+
+    return {"messages": [response], "ask_human": ask_human}
+
+# 5. human 节点
+def human_node(state: State):
+    new_messages = []
+    if not isinstance(state["messages"][-1], ToolMessage):
+        new_messages.append(
+            ToolMessage(
+                content="No response from human.",
+                tool_call_id=state["messages"][-1].tool_calls[0]["id"]
+            )
+        )
+    return {"messages": new_messages, "ask_human": False}
+
+# 6. ⭐ 自定义路由：先检查 ask_human，再看 tools_condition
+def select_next_node(state: State):
+    if state["ask_human"]:
+        return "human"           # LLM 请求人工 → 去 human 节点
+    return tools_condition(state)  # 否则走标准工具路由（搜索 or 结束）
+
+# 7. 构建 Graph
+graph_builder = StateGraph(State)
+graph_builder.add_node("chatbot", chatbot)
+graph_builder.add_node("tools", ToolNode(tools=[tool]))
+graph_builder.add_node("human", human_node)
+
+graph_builder.add_conditional_edges(
+    "chatbot", select_next_node,
+    {"human": "human", "tools": "tools", END: END},
+)
+graph_builder.add_edge("tools", "chatbot")
+graph_builder.add_edge("human", "chatbot")
+graph_builder.add_edge(START, "chatbot")
+
+memory = MemorySaver()
+graph = graph_builder.compile(
+    checkpointer=memory,
+    interrupt_before=["human"],  # ⭐ 只在去 human 之前中断
+)</code></pre>
+
+    <h3>三条路径</h3>
+
+    <p>这个 Graph 有三条可能的执行路径，由 <code>select_next_node</code> 函数在运行时决定：</p>
+
+    <div style="background:#1e2a3a;border-left:4px solid #4fc3f7;padding:12px 16px;margin:16px 0;border-radius:4px;">
+      <strong>路径 1：</strong>chatbot → human → chatbot → ...<br>
+      LLM 判断自己搞不定，调用了 RequestAssistance → ask_human=True → 路由到 human 节点<br><br>
+      <strong>路径 2：</strong>chatbot → tools → chatbot → ...<br>
+      LLM 判断需要搜索，发出 tool_call → tools_condition 检测到 → 路由到 tools 节点<br><br>
+      <strong>路径 3：</strong>chatbot → END<br>
+      LLM 直接给出答案 → tools_condition 返回 END → 对话结束
+    </div>
+
+    <h3>和第四部分人工参与的区别</h3>
+
+    <table>
+      <thead>
+        <tr>
+          <th></th>
+          <th>Part 4：interrupt_before</th>
+          <th>Part 6：自定义状态 + 路由</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>触发方式</td>
+          <td>外部强制中断</td>
+          <td>LLM 自己决定</td>
+        </tr>
+        <tr>
+          <td>中断点</td>
+          <td>每次到 tools 就停</td>
+          <td>只有 LLM 请求时才停</td>
+        </tr>
+        <tr>
+          <td>适用场景</td>
+          <td>所有工具调用都要审批</td>
+          <td>LLM 不确定时才找人</td>
+        </tr>
+        <tr>
+          <td>实现复杂度</td>
+          <td>一行配置</td>
+          <td>需要自定义 State、工具和路由</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <p>两种方式不是互斥的，可以组合使用。比如在 human 节点之前用 interrupt_before 做最后一次拦截，也是一种合理的设计。</p>
+
+    <h3>Pydantic 作为工具定义的黑魔法</h3>
+
+    <p>Part 6 里用 <code>class RequestAssistance(BaseModel)</code> 定义了一个工具，但没有任何函数体——只有类名和 docstring。这之所以能工作，是因为 LangChain 的 <code>bind_tools</code> 对 Pydantic 模型做了特殊处理：</p>
+
+    <ol>
+      <li>类名 <code>RequestAssistance</code> → 工具名</li>
+      <li>docstring → 工具描述（LLM 据此判断什么时候该用这个工具）</li>
+      <li>类字段 <code>request: str</code> → 工具参数定义</li>
+    </ol>
+
+    <p>如果 LLM 调用了这个工具，<code>tool_calls[0]["name"]</code> 就是 <code>"RequestAssistance"</code>，<code>tool_calls[0]["args"]</code> 就是 <code>{"request": "用户想取消订单，我查不到这个订单号"}</code>。你甚至不需要实现真正的工具逻辑——因为 chatbot 节点已经拦截了这个调用（检测到 ask_human=True），它不会真的走到 ToolNode 去执行。</p>
+
+    <p>这个模式的价值在于：<strong>LLM 自己判断什么时候需要人工。</strong>不是简单的关键字匹配，而是基于对话上下文做语义判断。用户问"今天天气怎么样"→ LLM 搜索；用户说"我账户里的钱不对，帮我看看怎么回事"→ LLM 调用 RequestAssistance。</p>
+
+    <h2>七、时间旅行：从任意历史点重新开始</h2>
+
+    <p>本来计划写到第六部分就收尾，但时间旅行这个能力实在太特别了，不写几句总觉得缺了点什么。它把前面的 Checkpointer、中断、状态修改全部串起来，是 LangGraph 最让我印象深刻的设计。</p>
+
+    <p>LangGraph 既然把每个节点的执行状态都存成了 checkpoint，那理论上你可以<strong>回到任意一个历史检查点，从那里走一条不同的路</strong>。</p>
+
+    <pre><code class="language-python"># 执行几轮对话后
+config = {"configurable": {"thread_id": "1"}}
+
+# 第一轮
+graph.stream({"messages": [("user", "帮我研究一下 LangGraph")]}, config)
+# 第二轮
+graph.stream({"messages": [("user", "我想用它做自主 Agent")]}, config)
+
+# ⭐ 查看所有历史检查点（从新到旧）
+to_replay = None
+for state in graph.get_state_history(config):
+    print(f"消息数量: {len(state.values['messages'])}, 下一步: {state.next}")
+    if len(state.values["messages"]) == 6:
+        to_replay = state  # 选定一个历史时刻
+
+# ⭐⭐ 从历史检查点继续——但走不同的路！
+# to_replay.config 包含了 checkpoint_id，LangGraph 自动恢复当时的完整 State
+for event in graph.stream(None, to_replay.config, stream_mode="values"):
+    if "messages" in event:
+        event["messages"][-1].pretty_print()
+# Graph 从那个历史时刻继续执行！</code></pre>
+
+    <p>时间旅行不是修改历史，而是<strong>创建分支</strong>——新的执行路径保存为新 checkpoint，旧的不受影响。这就像 RPG 游戏里的存档/读档机制：回到存档 2，这次选择"不打开宝箱"，走出全新的分支剧情。</p>
+
+    <h3>实际用途</h3>
+
+    <table>
+      <thead>
+        <tr>
+          <th>场景</th>
+          <th>说明</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>调试</td>
+          <td>出错了，回到出错前的检查点，修改参数重试</td>
+        </tr>
+        <tr>
+          <td>A/B 测试</td>
+          <td>同一问题从某点走不同路径，比较结果质量</td>
+        </tr>
+        <tr>
+          <td>错误修正</td>
+          <td>AI 判断错了，回到那个时间点纠正</td>
+        </tr>
+        <tr>
+          <td>探索</td>
+          <td>"如果 LLM 选了另一个工具会怎样？"</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <h2>概念地图：六个部分如何串在一起</h2>
+
+    <p>回到这六个部分，它们之间的关系是这样的：</p>
+
+    <pre><code class="language-plaintext">LangGraph 核心框架（StateGraph）
+  │
+  ├── State（状态）             ← 流水线上传递的数据，贯穿一切
+  ├── Node（节点）              ← LLM / Tool / Human 三种工位
+  └── Edge（边）                ← 普通边 / 条件边 / START-END
+        │
+        ├── Checkpointer        ← Part 3：每步自动存档
+        │     │
+        │     ├── interrupt     ← Part 4：到某个节点前暂停
+        │     │     │
+        │     │     └── update_state ← Part 5：手动修改存档
+        │     │
+        │     └── get_state_history ← Part 7：查看全部历史
+        │           │
+        │           └── 时间旅行：从任意存档重来
+        │
+        └── 自定义 State        ← Part 6：扩展 State 字段
+              │
+              └── LLM 自主决策路由</code></pre>
+
+    <p>可以看到，<strong>Checkpointer 是整个高级功能的基础</strong>——中断、手动修改状态、时间旅行，全都依赖它。而工具绑定（Part 2）让 Agent 从纯粹的对话机器变成了能行动的智能体。</p>
+
+    <p>我学习 LangGraph 最大的感受是：它把 Agent 开发的复杂度拆解得相当干净。StateGraph 就是一张图——你能在图纸上看清每一步的数据流。加上 Checkpointer 后，调试、回退、审批这些生产环境绕不开的问题都有了标准解法。1.2 版本的节点级超时和错误处理器进一步补齐了容错能力——这些我还没在生产环境实际验证过，但从设计上看思路是对的。</p>
+
+    <p>官方 Quick Start 教程的质量很高，这里的代码结构也基本遵循它的教学路径。不过 Quick Start 里的模型是 claude-3-5-sonnet，我在写的时候换成了 claude-sonnet-4-6——实测下来 4-6 的 tool_call 格式更稳定，很少出现参数格式错误。</p>
+
+    <p>另外，如果你打算把 LangGraph Agent 部署到生产环境，我建议关注三个点：一是 Checkpointer 选型——<code>MemorySaver</code> 只适合开发，生产至少用 <code>SqliteSaver</code>；二是 LangGraph 1.2 新增的<strong>节点级超时</strong>，可以防止某个 LLM 调用卡住整个流程；三是 <code>interrupt_before</code> 配合 <code>update_state</code> 搭审批流——这个组合解决了 Agent 不可控的核心焦虑。这三个点搞定，一个生产可用的 Agent 服务基本就成型了。</p>
+
+    <pre class="mermaid">
+graph TD
+    A[用户输入] --> B[chatbot 节点]
+    B --> C{select_next_node}
+    C -->|ask_human| D[human 节点]
+    C -->|有 tool_calls| E[tools 节点]
+    C -->|END| F[返回用户]
+    D --> B
+    E --> B
+    B -.->|每个节点后| G[(Checkpointer)]
+    G -.->|中断时| H[人工审查]
+    H -.->|update_state| G
+    G -.->|get_state_history| I[时间旅行]
+</pre>
+
+<script src="../assets/js/mermaid.min.js"></script>
+<script>
+  mermaid.initialize({ startOnLoad: true, theme: 'dark' });
+</script>
+
+  </article>
+
+  <script src="../assets/js/common.js"></script>
+
+</body>
+</html>

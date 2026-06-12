@@ -135,6 +135,13 @@
         if (typeof Prism !== 'undefined' && Prism.highlightAll) {
           Prism.highlightAll();
         }
+        // 为代码块设置语言标签
+        document.querySelectorAll('pre[class*="language-"]').forEach(function (pre) {
+          var match = pre.className.match(/language-(\w+)/);
+          if (match) {
+            pre.setAttribute('data-language', match[1]);
+          }
+        });
       });
     });
   } else {
@@ -144,6 +151,13 @@
       if (typeof Prism !== 'undefined' && Prism.highlightAll) {
         Prism.highlightAll();
       }
+      // 为代码块设置语言标签
+      document.querySelectorAll('pre[class*="language-"]').forEach(function (pre) {
+        var match = pre.className.match(/language-(\w+)/);
+        if (match) {
+          pre.setAttribute('data-language', match[1]);
+        }
+      });
     });
   }
 })();

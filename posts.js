@@ -1,5 +1,18 @@
-var POSTS_DATA = 
+var POSTS_DATA =
 [
+  {
+    "title": "LangGraph 实战教程：从零构建一个有记忆、会搜索、能审批的 AI Agent",
+    "slug": "2026-06-12-langgraph-hands-on-tutorial",
+    "date": "2026-06-12",
+    "tags": [
+      "LangGraph",
+      "AI Agent",
+      "LLM",
+      "工具调用",
+      "Python"
+    ],
+    "summary": "用 LangGraph 1.2 从零构建支持搜索、记忆、人工审批和自定义状态的 AI Agent，每步都有可运行代码。"
+  },
   {
     "title": "Gemma 4 QAT 本地部署：6 GB 显存跑 12B 多模态模型",
     "slug": "2026-06-07-gemma-4-qat-llamacpp-local",
