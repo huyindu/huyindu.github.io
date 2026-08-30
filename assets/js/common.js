@@ -38,10 +38,16 @@
       '</nav>';
 
     // --- 页脚 HTML ---
+    // ICP 备案号仅在本服务器（nginx/IP 访问）显示，GitHub Pages 不显示
+    var isGitHubPages = /\.github\.io$/.test(window.location.hostname);
+    var icpLine = isGitHubPages
+      ? ''
+      : '<p><a href="https://beian.miit.gov.cn" target="_blank" rel="noopener">京ICP备2020033934号</a></p>';
+
     var footerHTML =
       '<footer class="site-footer">' +
         '<p>&copy; 2026 HoEndo &middot; Powered by <a href="https://pages.github.com" target="_blank" rel="noopener">GitHub Pages</a></p>' +
-        '<p><a href="https://beian.miit.gov.cn" target="_blank" rel="noopener">京ICP备2020033934号</a></p>' +
+        icpLine +
       '</footer>';
 
     // --- 注入导航栏到 body 最前面 ---
